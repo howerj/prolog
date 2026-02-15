@@ -6,10 +6,11 @@
  *   features, just libraries).
  * - We could get away with using fewer types, most things can be
  *   treated as a cons list
+ * - Some more complex expressions fail, more testing is needed.
  * - Valgrind, AI/LLM code review, ...
  * - Garbage collection; make multiple versions (non-portable mark
  *   and sweep, mark and sweep, arena based).
- * - Add operators (cut, not, '_', input (read expression), output).
+ * - Add operators (cut, not, '_', equal, not-equal, input (read expression), output).
  * - Unit tests? Error handling
  * - Replace recursion with iteration where possible.
  * - Documentation
@@ -188,7 +189,6 @@ static int pl_puts(prolog_t *p, const char *s) {
 	return pl_error(p, 0);
 }
 
-/* we can reuse the lexer buf for this */
 static int pl_putf(prolog_t *p, uint8_t *buf, const size_t blen, const char *fmt, ...) {
 	assert(p);
 	assert(buf);
@@ -278,10 +278,11 @@ static void *pl_gc_allocate(prolog_t *p, const size_t bytes, const int type) {
 	if (p->fatal)
 		return NULL;
 	if (!p->gc) {
-		p->gc = pl_allocate(p, sizeof (p->gc[0]) * 512);
+		static const size_t gc_start_length = 512;
+		p->gc = pl_allocate(p, sizeof (p->gc[0]) * gc_start_length);
 		if (!p->gc)
 			return NULL;
-		p->gc_size = 512;
+		p->gc_size = gc_start_length;
 	}
 	if (p->gc_bytes >= PL_GC_THRESHOLD_BYTES) {
 		p->gc_bytes = 0;
@@ -308,19 +309,19 @@ static void *pl_gc_allocate(prolog_t *p, const size_t bytes, const int type) {
 	return r;
 }
 
-static void pl_gc_set_flag(pl_flags_t *flags, const int set) { assert(flags); if (set) { *flags |= PL_MARK; } else { *flags &= ~PL_MARK; } }
+static inline void pl_gc_set_or_clear_flag(pl_flags_t *flags, const int set) { assert(flags); if (set) { *flags |= PL_MARK; } else { *flags &= ~PL_MARK; } }
 
-static void pl_gc_set(void *x, const int type, const int set) {
+static void pl_gc_set(void *x, const int type, const int set) { /* "polymorphism" */
 	if (!x) return;
 	switch (type) {
-	case PL_CONS: { pl_term_t *n = x; pl_gc_set_flag(&n->flags, set); break; }
-	case PL_VAR: { pl_term_t *n = x; pl_gc_set_flag(&n->flags, set); break; }
-	case PL_ATOM: { pl_atom_t *n = x; pl_gc_set_flag(&n->flags, set); break; }
-	case PL_CLAUSE: { pl_clause_t *n = x; pl_gc_set_flag(&n->flags, set); break; }
-	case PL_GOAL: { pl_goal_t *n = x; pl_gc_set_flag(&n->flags, set); break; }
-	case PL_TRAIL: { pl_trail_t *n = x; pl_gc_set_flag(&n->flags, set); break; }
-	case PL_PROGRAM: { pl_program_t *n = x; pl_gc_set_flag(&n->flags, set); break; }
-	case PL_TVM: { pl_term_var_mapping_t *n = x; pl_gc_set_flag(&n->flags, set); break; }
+	case PL_CONS: { pl_term_t *n = x; pl_gc_set_or_clear_flag(&n->flags, set); break; }
+	case PL_VAR: { pl_term_t *n = x; pl_gc_set_or_clear_flag(&n->flags, set); break; }
+	case PL_ATOM: { pl_atom_t *n = x; pl_gc_set_or_clear_flag(&n->flags, set); break; }
+	case PL_CLAUSE: { pl_clause_t *n = x; pl_gc_set_or_clear_flag(&n->flags, set); break; }
+	case PL_GOAL: { pl_goal_t *n = x; pl_gc_set_or_clear_flag(&n->flags, set); break; }
+	case PL_TRAIL: { pl_trail_t *n = x; pl_gc_set_or_clear_flag(&n->flags, set); break; }
+	case PL_PROGRAM: { pl_program_t *n = x; pl_gc_set_or_clear_flag(&n->flags, set); break; }
+	case PL_TVM: { pl_term_var_mapping_t *n = x; pl_gc_set_or_clear_flag(&n->flags, set); break; }
 	default: never();
 	}
 }
@@ -342,9 +343,13 @@ static bool pl_gc_get(void *x, const int type) {
 	return !!(flags & PL_MARK);
 }
 
-// It would be best to mark pointers by setting their lowest bit, we should
-// assert that all allocated pointers are aligned, this is slightly
-// non-portable but should work everywhere with a non-broken allocator.
+/* Notes; instead of using a flag bit to save on space you could instead just
+ * use the Least Significant Bits to store the flag, as on all modern platforms
+ * these bits should be zero when allocating a pointer due to alignment
+ * restrictions, this is slightly not portable and "not allowed" by the C
+ * standard, but doing things like this can greatly increase the efficiency
+ * of the system. It is also not optimal storing the flags both in garbage
+ * collection structure and also within the objects themselves. */
 static void pl_gc_mark(prolog_t *p, void *x, const int type) {
 	assert(p);
 	if (!x)
@@ -1021,7 +1026,11 @@ again:
 	case ',': return PLEX_COMMA;
 	case '.': return PLEX_DOT;
 	case '(': return PLEX_LPAR;
-	case '?': return PLEX_QUERY;
+	case '?': 
+		ch = pl_get(p);
+		if (ch != '-')
+			return PLEX_ERROR;
+		return PLEX_QUERY;
 	case ')': return PLEX_RPAR;
 	case ':': {
 		ch = pl_get(p);
@@ -1154,14 +1163,14 @@ static int pl_grm_term(prolog_t *p, pl_term_var_mapping_t *map, pl_term_t **term
 		return 0;
 	pl_term_t *nterm = pl_term_cons_new(p, atom, 0, NULL);
 	*term = nterm;
-	if (pl_accept(p, '(')) {
+	if (pl_accept(p, PLEX_LPAR)) {
 		pl_goal_t *goal = NULL;
 		if (!pl_grm_rule(p, map, &goal, 1))
 			return 0;
 		for (pl_goal_t *n = goal; n; n = n->cdr)
 			if (!pl_term_append(p, nterm, n->car))
 				break;
-		return pl_expect(p, ')');
+		return pl_expect(p, PLEX_RPAR);
 	}
 	return 1;
 }
@@ -1183,7 +1192,7 @@ static int pl_grm_rule(prolog_t *p, pl_term_var_mapping_t *map, pl_goal_t **goal
 				return 0;
 			g = g->cdr;
 		}
-	} while (pl_accept(p, ','));
+	} while (pl_accept(p, PLEX_COMMA));
 	*goal = h;
 	return 1;
 }
@@ -1400,14 +1409,14 @@ static int pl_test2(prolog_t *p) {
 		"app(cons(X,L),M,cons(X,N)) :- app(L,M,N)."
 		"man(bob). man(socrates). woman(alice). mortal(X) :- man(X). mortal(X) :- woman(X).";
 	static const char *queries[] = {
-		"? app(I,J,cons(a,cons(b,cons(c,nil))))."
-		"? mortal(socrates).",
-		"? mortal(bob).",
-		"? mortal(alice).",
-		"? mortal(god).",
-		"? mortal(X).",
-		"? man(X).",
-		"? woman(X).",
+		"?- app(I,J,cons(a,cons(b,cons(c,nil))))."
+		"?- mortal(socrates).",
+		"?- mortal(bob).",
+		"?- mortal(alice).",
+		"?- mortal(god).",
+		"?- mortal(X).",
+		"?- man(X).",
+		"?- woman(X).",
 		/*"? X(alice).",*/
 	};
 	const size_t count = NELEMS(queries);
@@ -1533,7 +1542,7 @@ static int pl_help(FILE *out, const char *arg0) {
 		"\tterm    := var | [ atom { '(' rule ')' } ]\n"
 		"\trule    := term { ',' term }\n"
 		"\tclause  := term [ ':-' rule ]\n"
-		"\tgoal    := '?' rule\n"
+		"\tgoal    := '?-' rule\n"
 		"\tprogram := { [ goal | clause ] '.' } EOF\n\n",
 
 

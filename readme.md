@@ -13,3 +13,6 @@ It implements very little of the language, just the core of idea of it. This
 implementation includes a parser and garbage collection making it slightly
 more useful, for very small values of use. Consult the source for documentation
 and a list of to-dos.
+
+This interpreter is still being worked on, it should be considered to be in "alpha"
+status.
