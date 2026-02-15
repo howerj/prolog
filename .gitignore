@@ -1,0 +1,5 @@
+*.exe
+prolog
+*.a
+*.o
+*.txt
