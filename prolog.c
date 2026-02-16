@@ -531,8 +531,10 @@ static void pl_sweep(prolog_t *p) {
 	for (size_t i = 0; i < p->gc_used && i < left; i++) { /* compact */
 		if (p->gc[i].ptr == NULL) {
 			size_t j = i;
-			for (; p->gc[j].ptr == NULL; j++)
-				;
+			for (; p->gc[j].ptr == NULL; j++) {
+				assert(j < p->gc_used);
+				/*do nothing*/;
+			}
 			p->gc[i] = p->gc[j];
 			p->gc[j].ptr = NULL;
 			i = j + 1;
@@ -546,6 +548,8 @@ static void pl_gc(prolog_t *p, const int force) {
 	if (!on)
 		return;
 	pl_gc_mark(p, p->db, PL_PROGRAM);
+	pl_gc_mark(p, p->goal, PL_GOAL);
+	pl_gc_mark(p, p->sofar, PL_TRAIL);
 	pl_gc_mark(p, p->goal, PL_GOAL);
 	pl_sweep(p);
 }
@@ -946,9 +950,9 @@ static pl_term_t *pl_term_var_mapping_search(pl_term_var_mapping_t *map, const c
 	assert(map);
 	assert(name);
 	for (pl_term_var_mapping_t *m = map; m; m = m->parent)
-		for (size_t i = 0; i < map->length; i++)
-			if (!strcmp(map->name[i], name))
-				return map->var[i];
+		for (size_t i = 0; i < m->length; i++)
+			if (!strcmp(m->name[i], name))
+				return m->var[i];
 	return NULL;
 }
 
