@@ -1178,7 +1178,7 @@ static int pl_grm_term(prolog_t *p, pl_term_var_mapping_t *map, pl_term_t **term
 static int pl_grm_rule(prolog_t *p, pl_term_var_mapping_t *map, pl_goal_t **goal, int var) {
 	assert(p);
 	assert(goal);
-	pl_goal_t *g = NULL, *h = NULL;;
+	pl_goal_t *g = NULL, *h = NULL;
 	do {
 		pl_term_t *nterm = NULL;
 		if (!pl_grm_term(p, map, &nterm, var))
@@ -1243,9 +1243,8 @@ static int pl_grm_program(prolog_t *p, pl_term_var_mapping_t *map, pl_program_t 
 			return 1;
 		} else {
 			pl_clause_t *clause = NULL;
-			// TODO: This should be reset for each `dot`, the
-			// scopes should be per rule.
-			if (!pl_grm_clause(p, map, &clause))
+			pl_term_var_mapping_t *nmap = pl_term_var_mapping_new(p, NULL, NULL, 0);
+			if (!pl_grm_clause(p, nmap, &clause))
 				return 0;
 			if (p->sysflags & PL_SFLAG_REVERSE_PROGRAM_ORDER) {
 				progs = pl_program_new(p, clause, progs);
@@ -1409,7 +1408,7 @@ static int pl_test2(prolog_t *p) {
 		"app(cons(X,L),M,cons(X,N)) :- app(L,M,N)."
 		"man(bob). man(socrates). woman(alice). mortal(X) :- man(X). mortal(X) :- woman(X).";
 	static const char *queries[] = {
-		"?- app(I,J,cons(a,cons(b,cons(c,nil))))."
+		"?- app(I,J,cons(a,cons(b,cons(c,nil)))).",
 		"?- mortal(socrates).",
 		"?- mortal(bob).",
 		"?- mortal(alice).",
