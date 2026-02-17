@@ -59,6 +59,7 @@ OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. */
 #define never() assert(0)
 #define implies(P, Q) assert((!(P)) || (Q))
 #define mutual(P, Q) do { implies(P, Q); implies(Q, P); } while (0)
+#define nullable(X) /* used to indicate an argument is can be null */
 
 #ifndef NELEMS
 #define NELEMS(X) (sizeof (X) / sizeof ((X)[0]))
@@ -83,13 +84,13 @@ typedef struct pl_trail pl_trail_t;
 typedef struct pl_goal pl_goal_t;
 typedef struct pl_program pl_program_t;
 typedef struct pl_term_var_mapping pl_term_var_mapping_t;
+typedef pl_goal_t pl_clause_t;
 
 typedef uintptr_t pl_flags_t;
 enum { PL_CONS, PL_VAR, PL_ATOM, PL_CLAUSE, PL_GOAL, PL_TRAIL, PL_PROGRAM, PL_TVM, }; 
 typedef struct { pl_flags_t flags; char *name; } pl_atom_t; 
 typedef struct { pl_flags_t flags; pl_atom_t *fsym; pl_term_t **args; size_t arity; } pl_term_cons_t;
 typedef struct { pl_flags_t flags; pl_term_t *instance; int varno; } pl_term_var_t;
-typedef struct { pl_flags_t flags; /*pl_term_cons_t*/pl_term_t *car; pl_goal_t *cdr; } pl_clause_t;
 struct pl_term { pl_flags_t flags; union { pl_term_cons_t cons; pl_term_var_t var; } t; };
 struct pl_goal { pl_flags_t flags; /*pl_term_cons_t*/pl_term_t *car; pl_goal_t *cdr; };
 struct pl_trail { pl_flags_t flags; /*pl_term_var_t*/pl_term_t *car; pl_trail_t *cdr; };
@@ -352,7 +353,10 @@ static bool pl_gc_get(void *x, const int type) {
  * collection structure and also within the objects themselves. */
 static void pl_gc_mark(prolog_t *p, void *x, const int type) {
 	assert(p);
+	nullable(x);
 	if (!x)
+		return;
+	if (pl_gc_get(x, type))
 		return;
 	switch (type) {
 	case PL_CONS: {
@@ -444,6 +448,7 @@ static void pl_gc_mark(prolog_t *p, void *x, const int type) {
 
 static void pl_gc_free(prolog_t *p, void *x, const int type) {
 	assert(p);
+	nullable(x);
 	if (!x)
 		return;
 	switch (type) {
@@ -514,8 +519,6 @@ static void pl_gc_free(prolog_t *p, void *x, const int type) {
 
 static void pl_sweep(prolog_t *p) {
 	assert(p);
-	/*if (p->sysflags & PL_SFLAG_GC_OFF_E)
-		return;*/
 	size_t left = p->gc_used;
 	for (size_t i = 0; i < p->gc_used; i++) {
 		void *ptr = p->gc[i].ptr;
@@ -531,10 +534,8 @@ static void pl_sweep(prolog_t *p) {
 	for (size_t i = 0; i < p->gc_used && i < left; i++) { /* compact */
 		if (p->gc[i].ptr == NULL) {
 			size_t j = i;
-			for (; p->gc[j].ptr == NULL; j++) {
-				assert(j < p->gc_used);
+			for (;j < p->gc_used && p->gc[j].ptr == NULL; j++)
 				/*do nothing*/;
-			}
 			p->gc[i] = p->gc[j];
 			p->gc[j].ptr = NULL;
 			i = j + 1;
@@ -544,7 +545,7 @@ static void pl_sweep(prolog_t *p) {
 
 static void pl_gc(prolog_t *p, const int force) {
 	assert(p);
-	const int on = force || !!(p->sysflags & PL_SFLAG_GC_OFF_E);
+	const int on = force || !(p->sysflags & PL_SFLAG_GC_OFF_E);
 	if (!on)
 		return;
 	pl_gc_mark(p, p->db, PL_PROGRAM);
@@ -588,7 +589,7 @@ static int pl_atom_equal(pl_atom_t *a, pl_atom_t *b) {
 static pl_term_t *pl_term_cons_new(prolog_t *p, pl_atom_t *fsym, size_t arity, pl_term_t **terms) {
 	assert(p);
 	assert(fsym);
-	implies(arity != 0, terms);
+	mutual(arity != 0, terms);
 	pl_term_t *c = pl_gc_allocate(p, sizeof(*c), PL_CONS);
 	if (!c)
 		return NULL;
@@ -872,7 +873,7 @@ static int pl_goal_solver_step(prolog_t *p, pl_goal_t *g, pl_program_t *prog, in
 	if (p->maxlevel) {
 		if (level > p->maxlevel) {
 			(void)pl_putf(p, p->buf, sizeof p->buf, "maxlevel exceeded: %d\n", level);
-			return pl_error(p, -1); // TODO: Error? This should be non-fatal.
+			return -1; /* return non fatal error */
 		}
 	}
 	/* assert(map); <- nullable */
@@ -899,7 +900,7 @@ static int pl_goal_solver_step(prolog_t *p, pl_goal_t *g, pl_program_t *prog, in
 					return pl_error(p, -1);
 			} else {
 				if (pl_goal_solver_step(p, gdash, prog, level + 1, map) < 0)
-					return pl_error(p, -1);
+					return -1; /* potential non fatal error */
 			}
 		} else {
 			if (!(p->sysflags & PL_SFLAG_PRINT_ONLY_MATCHES)) {
@@ -916,8 +917,8 @@ static int pl_goal_solver_step(prolog_t *p, pl_goal_t *g, pl_program_t *prog, in
 
 static pl_term_var_mapping_t *pl_term_var_mapping_new(prolog_t *p, pl_term_t **ts, char **names, size_t count) {
 	assert(p);
-	implies(count != 0, ts);
-	implies(count != 0, names);
+	mutual(count != 0, ts);
+	mutual(count != 0, names);
 	pl_term_var_mapping_t *tvm = pl_gc_allocate(p, sizeof *tvm, PL_TVM);
 	pl_term_t **_ts = count ? pl_allocate(p, sizeof (_ts[0]) * count) : NULL;
 	char **_names = count ? pl_allocate(p, sizeof (_names[0]) * count) : NULL;
@@ -1338,6 +1339,7 @@ static int pl_eval(prolog_t *p, const char *s) {
 	p->get = pl_get_string_cb;
 	pl_get_string_t v = { .program = s, .length = strlen(s), };
 	p->in = &v;
+	p->varno = 1;
 	const int st = pl_parse(p, map, &program, &goal);
 	if (!st) {
 		r = -1;
@@ -1351,9 +1353,16 @@ static int pl_eval(prolog_t *p, const char *s) {
 		p->db = program;
 	}
 	if (goal) {
-		if (pl_goal_solve(p, goal, p->db, map) < 0) {
-			r = -1;
-			goto end;
+		if (!p->db) {
+			if (pl_puts(p, "No program.\n") < 0) {
+				r = -1;
+				goto end;
+			}
+		} else {
+			if (pl_goal_solve(p, goal, p->db, map) < 0) {
+				r = -1;
+				goto end;
+			}
 		}
 	}
 end:
@@ -1362,6 +1371,9 @@ end:
 	return r;
 }
 
+/* Instead of parsing a string we can instead construct a prolog program via
+ * calling prolog constructs directly. It is far more cumbersome, but it has
+ * some utility (especially if you can generate this code). */
 static int pl_test1(prolog_t *p) {
 	assert(p);
 	pl_atom_t *at_app = pl_atom_new(p, "app");
@@ -1420,6 +1432,10 @@ static int pl_test2(prolog_t *p) {
 		"?- mortal(X).",
 		"?- man(X).",
 		"?- woman(X).",
+		"?- man(Y), woman(X).",
+		"?- man(X), woman(X).",
+		"?- man(X), mortal(X).",
+		"?- man(Y), mortal(X).",
 		/*"? X(alice).",*/
 	};
 	const size_t count = NELEMS(queries);
@@ -1527,6 +1543,7 @@ static int pl_help(FILE *out, const char *arg0) {
 		"Version: " PL_VERSION "\n"
 		"\nOptions:\n"
 		"\t-h, display this help message and quit.\n"
+		"\t-o key=value. set an option.\n"
 		"\t-t, run built in tests.\n"
 		"\t-p, read program from stdin and execute query.\n"
 		"\nThis program return non-zero on error.\n\n"
@@ -1584,6 +1601,7 @@ static int pl_set_option(prolog_t *s, char *kv) {
 		return -1;
 	}
 	*v++ = '\0';
+	if (!strcmp(k, "depth")) { s->maxlevel = atol(v); return 0; }
 	const long r = pl_flag(v);
 	if (r < 0) return -1;
 	if (!strcmp(k, "gc"))     { pl_set_flag(&s->sysflags, PL_SFLAG_GC_OFF_E, !r); } 
@@ -1634,7 +1652,7 @@ int main(int argc, char **argv) {
 			pl_term_var_mapping_t *map = pl_term_var_mapping_new(p, NULL, NULL, 0);
 			pl_parse(p, map, &program, &goal);
 			if (goal)
-				pl_goal_solve(p, goal, program, NULL);
+				pl_goal_solve(p, goal, program, map);
 			pl_deinit(p);
 			return 0;
 		}

@@ -3,3 +3,4 @@ prolog
 *.a
 *.o
 *.txt
+.gdb_history
