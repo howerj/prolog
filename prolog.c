@@ -114,7 +114,7 @@ typedef struct {
 	pl_gc_t *gc;     /* list of items that the garbage collector keeps track of */
 	size_t gc_used,  /* number of elements of `gc` that are used */
 	       gc_size,  /* size of `gc` */
-	       gc_bytes; /* counter of bytes allocated, used to determine when to GC */
+	       gc_bytes_since_last_gc; /* counter of bytes allocated, used to determine when to GC */
 	int (*get)(void *in); /* get a character of input */
 	int (*put)(void *out, int ch); /* output a character of output */
 	void *in, *out;    /* `in` and `out` passed to `get` and `put` */
@@ -242,7 +242,7 @@ static void *pl_allocate(prolog_t *p, const size_t bytes) {
 			return NULL;
 		}
 	}
-	p->gc_bytes += bytes;
+	p->gc_bytes_since_last_gc += bytes;
 	memset(r, 0, bytes);
 	return r;
 }
@@ -253,10 +253,10 @@ static void *pl_reallocate(prolog_t *p, void *ptr, const size_t bytes) {
 		return NULL;
 	void *r = p->alloc(p->arena, ptr, 0, bytes);
 	if (!r) {
-		p->fatal = -1;
+		p->fatal = PL_ERROR_OUT_OF_MEMORY_E;
 		return NULL;
 	}
-	p->gc_bytes += bytes;
+	p->gc_bytes_since_last_gc += bytes;
 	return r;
 }
 
@@ -285,8 +285,8 @@ static void *pl_gc_allocate(prolog_t *p, const size_t bytes, const int type) {
 			return NULL;
 		p->gc_size = gc_start_length;
 	}
-	if (p->gc_bytes >= PL_GC_THRESHOLD_BYTES) {
-		p->gc_bytes = 0;
+	if (p->gc_bytes_since_last_gc >= PL_GC_THRESHOLD_BYTES) {
+		p->gc_bytes_since_last_gc = 0;
 		pl_gc(p, 0);
 	}
 	void *r = pl_allocate(p, bytes);
@@ -536,11 +536,15 @@ static void pl_sweep(prolog_t *p) {
 			size_t j = i;
 			for (;j < p->gc_used && p->gc[j].ptr == NULL; j++)
 				/*do nothing*/;
+			if (j >= p->gc_used)
+				break;
 			p->gc[i] = p->gc[j];
 			p->gc[j].ptr = NULL;
-			i = j + 1;
+			i = j;
 		}
 	}
+	// TODO: Fix this!
+	/*p->gc_used = left;*/
 }
 
 static void pl_gc(prolog_t *p, const int force) {
@@ -552,7 +556,9 @@ static void pl_gc(prolog_t *p, const int force) {
 	pl_gc_mark(p, p->goal, PL_GOAL);
 	pl_gc_mark(p, p->sofar, PL_TRAIL);
 	pl_gc_mark(p, p->goal, PL_GOAL);
+	pl_gc_mark(p, p->map, PL_TVM);
 	pl_sweep(p);
+	p->gc_bytes_since_last_gc = 0;
 }
 
 static pl_atom_t *pl_atom_new(prolog_t *p, const char *name) {
@@ -704,9 +710,7 @@ static bool pl_term_unify(prolog_t *p, pl_term_t *s, pl_term_t *t) {
 		pl_term_t *x = t; /* swap unification target */
 		t = s;
 		s = x;
-		if (!pl_atom_equal(s->t.cons.fsym, t->t.cons.fsym) && s->t.cons.arity == t->t.cons.arity)
-			return false;
-		if (s->t.cons.arity != t->t.cons.arity) // !!
+		if (!pl_atom_equal(s->t.cons.fsym, t->t.cons.fsym) || s->t.cons.arity != t->t.cons.arity)
 			return false;
 		for (size_t i = 0; i < s->t.cons.arity; i++)
 			if (!pl_term_unify(p, s->t.cons.args[i], t->t.cons.args[i]))

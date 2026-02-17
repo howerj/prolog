@@ -13,4 +13,4 @@ ${TARGET}: ${TARGET}.c makefile
 	${CC} ${CFLAGS} ${TARGET}.c -o $@
 
 clean:
-	rm -fv ${TARGET} *.exe
+	git clean -dffx
