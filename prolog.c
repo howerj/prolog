@@ -310,13 +310,14 @@ static void pl_gc_stack_push(prolog_t *p, void *x, const int type) {
 	assert(p->gc_stk_idx < p->gc_stk_size);
 	p->stack[p->gc_stk_idx].ptr = x;
 	p->stack[p->gc_stk_idx].type = /*PL_MARK |*/ type;
-	if ((p->gc_stk_idx + 1) > p->gc_stk_size) {
+	if ((p->gc_stk_idx + 1) >= p->gc_stk_size) {
 		const size_t nsz = p->gc_stk_size * 2;
 		assert(nsz > p->gc_stk_size);
 		void *r = pl_reallocate(p, p->stack, sizeof (p->stack[0]) * nsz);
 		if (!r)
 			return;
 		p->stack = r;
+		p->gc_stk_size = nsz;
 	}
 	p->gc_stk_idx++;
 }
@@ -950,9 +951,9 @@ static int pl_goal_solver_step(prolog_t *p, pl_goal_t *g, pl_program_t *prog, in
 	const size_t gstk = p->gc_stk_idx;
 	for (pl_program_t *q = prog; q != NULL; q = q->cdr) {
 		pl_trail_t *t = pl_trail_note(p);
-		pl_gc_stack_push(p, t, PL_TRAIL);
+		//pl_gc_stack_push(p, t, PL_TRAIL);
 		pl_clause_t *c = pl_clause_copy(p, q->car); // TODO: add to gc stack
-		pl_gc_stack_push(p, c, PL_CLAUSE);
+		//pl_gc_stack_push(p, c, PL_CLAUSE);
 		pl_trail_undo(p, t);
 		if (!(p->sysflags & PL_SFLAG_PRINT_ONLY_MATCHES)) {
 			if (pl_indent(p, level) < 0) return pl_error(p, -1);
@@ -962,7 +963,7 @@ static int pl_goal_solver_step(prolog_t *p, pl_goal_t *g, pl_program_t *prog, in
 		}
 		if (pl_term_unify(p, g->car, c->car)) {
 			pl_goal_t *gdash = c->cdr == NULL ? g->cdr : pl_goal_append(p, c->cdr, g->cdr);
-			pl_gc_stack_push(p, gdash, PL_GOAL);
+			//pl_gc_stack_push(p, gdash, PL_GOAL);
 			if (gdash == NULL) {
 				if (pl_term_var_mapping_show_answer(p, map) < 0)
 					return pl_error(p, -1);
