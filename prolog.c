@@ -69,7 +69,7 @@ OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. */
 #define PL_TYPE_MSK (0xFu)
 
 #ifndef PL_GC_THRESHOLD_BYTES
-#define PL_GC_THRESHOLD_BYTES (32768)
+#define PL_GC_THRESHOLD_BYTES (1 << 16)
 #endif
 
 struct pl_term;
@@ -112,8 +112,12 @@ typedef struct {
 	void *(*alloc)(void *arena, void *ptr, size_t old_sz, size_t new_sz); /* custom memory allocator function */
 	void *arena;     /* passed to `alloc` */
 	pl_gc_t *gc;     /* list of items that the garbage collector keeps track of */
+	pl_gc_t *stack;  /* */
+	// TODO: GC stack is also needed, and could replace / augment `gc`.
 	size_t gc_used,  /* number of elements of `gc` that are used */
 	       gc_size,  /* size of `gc` */
+	       gc_stk_idx,  /* index into `stack` */
+	       gc_stk_size, /* size of `stack` */
 	       gc_bytes_since_last_gc; /* counter of bytes allocated, used to determine when to GC */
 	int (*get)(void *in); /* get a character of input */
 	int (*put)(void *out, int ch); /* output a character of output */
@@ -226,6 +230,26 @@ static void *pl_alloc_cb(void *arena, void *ptr, size_t old_sz, size_t new_sz) {
 	return realloc(ptr, new_sz);
 }
 
+static void pl_set_flag(unsigned *flags, const unsigned which, const int on) {
+	assert(flags);
+	if (on)
+		*flags |= which;
+	else
+		*flags &= ~which;
+}
+
+static int pl_gc_off(prolog_t *p) {
+	const int r = p->sysflags & PL_SFLAG_GC_OFF_E;
+	pl_set_flag(&p->sysflags, PL_SFLAG_GC_OFF_E, 1);
+	return r;
+}
+
+static int pl_gc_on(prolog_t *p) {
+	const int r = p->sysflags & PL_SFLAG_GC_OFF_E;
+	pl_set_flag(&p->sysflags, PL_SFLAG_GC_OFF_E, 0);
+	return r;
+}
+
 static void pl_gc(prolog_t *p, int force);
 
 static void *pl_allocate(prolog_t *p, const size_t bytes) { 
@@ -274,6 +298,29 @@ static char *pl_strdup(prolog_t *p, const char *s) {
 	return r ? memcpy(r, s, sz) : r;
 }
 
+static void pl_gc_stack_push(prolog_t *p, void *x, const int type) {
+	assert(p);
+	if (!p->stack) {
+		const size_t sz = 512;
+		p->stack = pl_allocate(p, sizeof (p->stack[0]) * sz);
+		if (!p->stack)
+			return;
+		p->gc_stk_size = sz;
+	}
+	assert(p->gc_stk_idx < p->gc_stk_size);
+	p->stack[p->gc_stk_idx].ptr = x;
+	p->stack[p->gc_stk_idx].type = /*PL_MARK |*/ type;
+	if ((p->gc_stk_idx + 1) > p->gc_stk_size) {
+		const size_t nsz = p->gc_stk_size * 2;
+		assert(nsz > p->gc_stk_size);
+		void *r = pl_reallocate(p, p->stack, sizeof (p->stack[0]) * nsz);
+		if (!r)
+			return;
+		p->stack = r;
+	}
+	p->gc_stk_idx++;
+}
+
 static void *pl_gc_allocate(prolog_t *p, const size_t bytes, const int type) {
 	assert(p);
 	if (p->fatal)
@@ -293,6 +340,7 @@ static void *pl_gc_allocate(prolog_t *p, const size_t bytes, const int type) {
 	if (!r) {
 		return NULL;
 	}
+	// TODO: Add to stack
 	assert(p->gc_used < p->gc_size);
 	assert(type < 256);
 	p->gc[p->gc_used].ptr = r;
@@ -307,7 +355,15 @@ static void *pl_gc_allocate(prolog_t *p, const size_t bytes, const int type) {
 		p->gc_size = new_size;
 	}
 	p->gc_used++;
+	pl_gc_stack_push(p, r, type);
 	return r;
+}
+
+static void pl_gc_stack_set(prolog_t *p, size_t index) {
+	assert(p);
+	implies(p->gc_stk_size != 0, index < p->gc_stk_size);
+	assert(index <= p->gc_stk_idx);
+	p->gc_stk_idx = index;
 }
 
 static inline void pl_gc_set_or_clear_flag(pl_flags_t *flags, const int set) { assert(flags); if (set) { *flags |= PL_MARK; } else { *flags &= ~PL_MARK; } }
@@ -557,6 +613,8 @@ static void pl_gc(prolog_t *p, const int force) {
 	pl_gc_mark(p, p->sofar, PL_TRAIL);
 	pl_gc_mark(p, p->goal, PL_GOAL);
 	pl_gc_mark(p, p->map, PL_TVM);
+	for (size_t i = 0; i < p->gc_stk_idx; i++)
+		pl_gc_mark(p, p->stack[i].ptr, p->stack[i].type & PL_TYPE_MSK);
 	pl_sweep(p);
 	p->gc_bytes_since_last_gc = 0;
 }
@@ -874,6 +932,8 @@ static int pl_goal_solver_step(prolog_t *p, pl_goal_t *g, pl_program_t *prog, in
 	assert(prog);
 	if (p->fatal)
 		return pl_error(p, -1);
+	//if (level == 0) 
+	//	pl_gc_stack_set(p, 0);
 	if (p->maxlevel) {
 		if (level > p->maxlevel) {
 			(void)pl_putf(p, p->buf, sizeof p->buf, "maxlevel exceeded: %d\n", level);
@@ -887,9 +947,12 @@ static int pl_goal_solver_step(prolog_t *p, pl_goal_t *g, pl_program_t *prog, in
 		if (pl_goal_print(p, g) < 0) return pl_error(p, -1);
 		if (pl_puts(p, "\n") < 0) return pl_error(p, -1);
 	}
+	const size_t gstk = p->gc_stk_idx;
 	for (pl_program_t *q = prog; q != NULL; q = q->cdr) {
 		pl_trail_t *t = pl_trail_note(p);
-		pl_clause_t *c = pl_clause_copy(p, q->car);
+		pl_gc_stack_push(p, t, PL_TRAIL);
+		pl_clause_t *c = pl_clause_copy(p, q->car); // TODO: add to gc stack
+		pl_gc_stack_push(p, c, PL_CLAUSE);
 		pl_trail_undo(p, t);
 		if (!(p->sysflags & PL_SFLAG_PRINT_ONLY_MATCHES)) {
 			if (pl_indent(p, level) < 0) return pl_error(p, -1);
@@ -899,6 +962,7 @@ static int pl_goal_solver_step(prolog_t *p, pl_goal_t *g, pl_program_t *prog, in
 		}
 		if (pl_term_unify(p, g->car, c->car)) {
 			pl_goal_t *gdash = c->cdr == NULL ? g->cdr : pl_goal_append(p, c->cdr, g->cdr);
+			pl_gc_stack_push(p, gdash, PL_GOAL);
 			if (gdash == NULL) {
 				if (pl_term_var_mapping_show_answer(p, map) < 0)
 					return pl_error(p, -1);
@@ -916,6 +980,7 @@ static int pl_goal_solver_step(prolog_t *p, pl_goal_t *g, pl_program_t *prog, in
 		if (p->fatal)
 			return pl_error(p, -1);
 	}
+	pl_gc_stack_set(p, gstk);
 	return pl_error(p, 0);
 }
 
@@ -924,6 +989,7 @@ static pl_term_var_mapping_t *pl_term_var_mapping_new(prolog_t *p, pl_term_t **t
 	mutual(count != 0, ts);
 	mutual(count != 0, names);
 	pl_term_var_mapping_t *tvm = pl_gc_allocate(p, sizeof *tvm, PL_TVM);
+	// TODO: Rename vars
 	pl_term_t **_ts = count ? pl_allocate(p, sizeof (_ts[0]) * count) : NULL;
 	char **_names = count ? pl_allocate(p, sizeof (_names[0]) * count) : NULL;
 	if (count) {
@@ -974,11 +1040,11 @@ static pl_term_t *pl_term_var_mapping_add(prolog_t *p, pl_term_var_mapping_t *ma
 		return NULL;
 	map->var = ts;
 	_name = pl_reallocate(p, map->name, sizeof (_name[0]) * (map->length + 1));
-	if (!_name)
+	if (!_name) /* partial initialization handled by GC */
 		return NULL;
 	map->name = _name;
 	char *n = pl_strdup(p, name);
-	if (!n)
+	if (!n) /* partial initialization handled by GC */
 		return NULL;
 	map->name[map->length] = n;
 	t = pl_term_var_new(p);
@@ -995,11 +1061,7 @@ static inline pl_term_t *pl_cons3(prolog_t *p, pl_atom_t *a, pl_term_t *x, pl_te
 static int pl_put_file_cb(void *out, const int ch) { assert(out); return fputc(ch, out) < 0 ? -1 : 0; }
 static int pl_get_file_cb(void *in) { assert(in); return fgetc(in); }
 
-typedef struct {
-	const char *program;
-	size_t length;
-	size_t _index;
-} pl_get_string_t;
+typedef struct { const char *program; size_t length; size_t _index; } pl_get_string_t;
 
 static int pl_get_string_cb(void *in) {
 	assert(in);
@@ -1275,14 +1337,6 @@ static int pl_grm_program(prolog_t *p, pl_term_var_mapping_t *map, pl_program_t 
 	return pl_expect(p, PLEX_EOF);
 }
 
-static void pl_set_flag(unsigned *flags, const unsigned which, const int on) {
-	assert(flags);
-	if (on)
-		*flags |= which;
-	else
-		*flags &= ~which;
-}
-
 static int pl_parse(prolog_t *p, pl_term_var_mapping_t *map, pl_program_t **program, pl_goal_t **goal) {
 	assert(p);
 	const unsigned sysflags = p->sysflags;
@@ -1303,32 +1357,43 @@ static pl_program_t *pl_program_tail(pl_program_t *prog) {
 
 static int pl_program_append(prolog_t *p, pl_program_t *prog) {
 	assert(p);
-	assert(prog);
-	const int reverse = !!(p->sysflags & PL_SFLAG_REVERSE_PROGRAM_ORDER);
+	if (!prog)
+		return 0;
 	if (!p->db) {
 		p->db = prog;
 		p->tail = pl_program_tail(p->db);
+		return 0;
+	} 
+	const int reverse = !!(p->sysflags & PL_SFLAG_REVERSE_PROGRAM_ORDER);
+	if (reverse) {
+		p->tail = pl_program_tail(prog);
+		p->tail->cdr = p->db;
+		p->db = prog;
 	} else {
-		if (reverse) {
-			p->tail = pl_program_tail(prog);
-			p->tail->cdr = p->db;
-			p->db = prog;
-		} else {
-			assert(p->tail);
-			p->tail->cdr = prog;
-			p->tail = pl_program_tail(prog);
-
-		}
+		assert(p->tail);
+		p->tail->cdr = prog;
+		p->tail = pl_program_tail(prog);
 	}
 	return 0;
 }
 
 static int pl_goal_solve(prolog_t *p, pl_goal_t *g, pl_program_t *prog, pl_term_var_mapping_t *map) {
 	assert(p);
-	// TODO: Fixthis
-	p->db = prog;
+	if (pl_program_append(p, prog) < 0)
+		return pl_error(p, -1);
+	if (!g)
+		return 0;
+	if (!prog && !p->db) {
+		if (pl_puts(p, "No program.\n") < 0)
+			return pl_error(p, PL_ERROR_OUTPUT_E);
+		return 0;
+	}
 	p->goal = g;
-	return pl_goal_solver_step(p, g, prog, 0, map);
+	p->map = map;
+	const size_t prior = p->gc_stk_idx;
+	const int r = pl_goal_solver_step(p, g, p->db, 0, map);
+	pl_gc_stack_set(p, prior);
+	return r;
 }
 
 static int pl_eval(prolog_t *p, const char *s) {
@@ -1344,35 +1409,27 @@ static int pl_eval(prolog_t *p, const char *s) {
 	pl_get_string_t v = { .program = s, .length = strlen(s), };
 	p->in = &v;
 	p->varno = 1;
+	// TODO: while(!EOF) {
 	const int st = pl_parse(p, map, &program, &goal);
 	if (!st) {
 		r = -1;
 		goto end;
 	}
-	/*if (pl_program_append(p, program) < 0) {
+	if (pl_goal_solve(p, goal, program, map) < 0) {
 		r = -1;
 		goto end;
-	}*/
-	if (program) {
-		p->db = program;
 	}
-	if (goal) {
-		if (!p->db) {
-			if (pl_puts(p, "No program.\n") < 0) {
-				r = -1;
-				goto end;
-			}
-		} else {
-			if (pl_goal_solve(p, goal, p->db, map) < 0) {
-				r = -1;
-				goto end;
-			}
-		}
-	}
+	// }
 end:
 	p->in = in;
 	p->get = get;
 	return r;
+}
+
+static void pl_reset(prolog_t *p) {
+	assert(p);
+	p->db = NULL;
+	p->tail = NULL;
 }
 
 /* Instead of parsing a string we can instead construct a prolog program via
@@ -1380,6 +1437,7 @@ end:
  * some utility (especially if you can generate this code). */
 static int pl_test1(prolog_t *p) {
 	assert(p);
+	pl_set_flag(&p->sysflags, PL_SFLAG_GC_OFF_E, 1);
 	pl_atom_t *at_app = pl_atom_new(p, "app");
 	pl_atom_t *at_cons = pl_atom_new(p, "cons");
 	pl_term_t *f_nil = pl_cons0(p, pl_atom_new(p, "nil"));
@@ -1414,8 +1472,10 @@ static int pl_test1(prolog_t *p) {
 	char *varname[] =  { "I", "J", };
 	pl_term_var_mapping_t *var_name_map = pl_term_var_mapping_new(p, varvar, varname, NELEMS(varname));
 
+	pl_set_flag(&p->sysflags, PL_SFLAG_GC_OFF_E, 0);
 	if (pl_puts(p, "=======Append with traditional clause order:\n") < 0) return -1;
 	pl_goal_solve(p, g1, test_p1, var_name_map);
+	pl_reset(p);
 	if (pl_puts(p, "\n=======Append with reversed clause order:\n") < 0) return -1;
 	pl_goal_solve(p, g1, test_p2, var_name_map);
 	return 0;
@@ -1423,10 +1483,10 @@ static int pl_test1(prolog_t *p) {
 
 static int pl_test2(prolog_t *p) {
 	assert(p);
-	static const char *pstring = 
+	static const char *database = 
 		"app(nil,X,X). "
-		"app(cons(X,L),M,cons(X,N)) :- app(L,M,N)."
-		"man(bob). man(socrates). woman(alice). mortal(X) :- man(X). mortal(X) :- woman(X).";
+		"app(cons(X,L),M,cons(X,N)) :- app(L,M,N). "
+		"man(bob). man(socrates). woman(alice). mortal(X) :- man(X). mortal(X) :- woman(X)." ;
 	static const char *queries[] = {
 		"?- app(I,J,cons(a,cons(b,cons(c,nil)))).",
 		"?- mortal(socrates).",
@@ -1444,7 +1504,7 @@ static int pl_test2(prolog_t *p) {
 	};
 	const size_t count = NELEMS(queries);
 
-	if (pl_eval(p, pstring) < 0)
+	if (pl_eval(p, database) < 0)
 		return -1;
 	for (size_t i = 0; i < count; i++) {
 		uint8_t buf[128] = { 0, };
@@ -1579,9 +1639,13 @@ static int pl_deinit(prolog_t *p) {
 	pl_sweep(p);
 	pl_release(p, p->gc);
 	pl_release(p, p->lex.buf);
+	pl_release(p, p->stack);
 	p->lex.used = 0;
 	p->lex.length = 0;
 	p->gc = NULL;
+	p->stack = NULL;
+	p->db = NULL;
+	p->tail = NULL;
 	return 0;
 }
 
@@ -1626,6 +1690,7 @@ int main(int argc, char **argv) {
 		case 'h': return pl_help(stderr, argv[0]) < 0;
 		case 't': {
 			const int r1 = pl_test1(p);
+			pl_reset(p);
 			const int r2 = pl_test2(p);
 			pl_deinit(p);
 			return r1 < 0 || r2 < 0;
@@ -1655,10 +1720,11 @@ int main(int argc, char **argv) {
 			pl_goal_t *goal = NULL;
 			pl_term_var_mapping_t *map = pl_term_var_mapping_new(p, NULL, NULL, 0);
 			pl_parse(p, map, &program, &goal);
+			int r = 0;
 			if (goal)
-				pl_goal_solve(p, goal, program, map);
+				r = pl_goal_solve(p, goal, program, map);
 			pl_deinit(p);
-			return 0;
+			return r < 0;
 		}
 		case 'P': {
 			const int r = pl_eval(p, opt.arg);
