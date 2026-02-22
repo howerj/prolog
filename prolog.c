@@ -1,6 +1,4 @@
 /* TODO:
- * - Implement parser
- *   - Special parser arena, no frees
  * - Mention; CPP program, Microsoft Prolog Driver Paper, GP A* search
  *   for games, how prolog should be a library (you do not need language
  *   features, just libraries).
@@ -8,12 +6,14 @@
  *   treated as a cons list
  * - Some more complex expressions fail, more testing is needed.
  * - Valgrind, AI/LLM code review, ...
+ * - Custom memory arena
  * - Garbage collection; make multiple versions (non-portable mark
  *   and sweep, mark and sweep, arena based).
  * - Add operators (cut, not, '_', equal, not-equal, input (read expression), output).
  * - Unit tests? Error handling
  * - Replace recursion with iteration where possible.
- * - Documentation
+ * - Documentation; This file should be documented in as much detail
+ *   as possible.
  * - Make sure variable is not reused between rules / can be different
  * - Debug variable names and print out id number
  * - Optimizations (mainly around memory usage, not speed).
@@ -54,7 +54,7 @@ OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. */
 #define PL_LICENSE "0BSD"
 #define PL_EMAIL   "howe.r.j.89@gmail.com"
 #define PL_REPO    "https://github.com/howerj/prolog"
-#define PL_VERSION "v0.0.1"
+#define PL_VERSION "v0.0.2"
 
 #define never() assert(0)
 #define implies(P, Q) assert((!(P)) || (Q))
@@ -742,8 +742,6 @@ static int pl_term_print(prolog_t *p, pl_term_t *t) {
 		break;
 	}
 	case PL_VAR:
-		// TODO: Print out variable name if known, this should help in
-		// debugging the interpreter.
 		if (t->t.var.instance != t) {
 			if (pl_term_print(p, t->t.var.instance) < 0) return pl_error(p, -1);
 		} else {
@@ -950,9 +948,7 @@ static int pl_goal_solver_step(prolog_t *p, pl_goal_t *g, pl_program_t *prog, in
 	const size_t gstk = p->gc_stk_idx;
 	for (pl_program_t *q = prog; q != NULL; q = q->cdr) {
 		pl_trail_t *t = pl_trail_note(p);
-		//pl_gc_stack_push(p, t, PL_TRAIL);
 		pl_clause_t *c = pl_clause_copy(p, q->car); // TODO: add to gc stack
-		//pl_gc_stack_push(p, c, PL_CLAUSE);
 		pl_trail_undo(p, t);
 		if (!(p->sysflags & PL_SFLAG_PRINT_ONLY_MATCHES)) {
 			if (pl_indent(p, level) < 0) return pl_error(p, -1);
@@ -962,7 +958,6 @@ static int pl_goal_solver_step(prolog_t *p, pl_goal_t *g, pl_program_t *prog, in
 		}
 		if (pl_term_unify(p, g->car, c->car)) {
 			pl_goal_t *gdash = c->cdr == NULL ? g->cdr : pl_goal_append(p, c->cdr, g->cdr);
-			//pl_gc_stack_push(p, gdash, PL_GOAL);
 			if (gdash == NULL) {
 				if (pl_term_var_mapping_show_answer(p, map) < 0)
 					return pl_error(p, -1);
@@ -1058,7 +1053,7 @@ static inline pl_term_t *pl_cons1(prolog_t *p, pl_atom_t *a, pl_term_t *x) { ret
 static inline pl_term_t *pl_cons2(prolog_t *p, pl_atom_t *a, pl_term_t *x, pl_term_t *y) { return pl_term_cons_new(p, a, 2, (pl_term_t *[]){x, y}); }
 static inline pl_term_t *pl_cons3(prolog_t *p, pl_atom_t *a, pl_term_t *x, pl_term_t *y, pl_term_t *z) { return pl_term_cons_new(p, a, 3, (pl_term_t *[]){x, y, z}); }
 
-static int pl_put_file_cb(void *out, const int ch) { assert(out); return fputc(ch, out) < 0 ? -1 : 0; }
+static int pl_put_file_cb(void *out, const int ch) { assert(out); if (fputc(ch, out) < 0) return -1; return fflush(out) < 0 ? -1 : 0; }
 static int pl_get_file_cb(void *in) { assert(in); return fgetc(in); }
 
 typedef struct { const char *program; size_t length; size_t _index; } pl_get_string_t;
@@ -1149,6 +1144,12 @@ again:
 	return PLEX_ERROR;
 }
 
+
+static inline int pl_peek(prolog_t *p) {
+	assert(p);
+	return p->sym;
+}
+
 static int pl_accept(prolog_t *p, int sym) {
 	assert(p);
 	if (p->sym == sym) {
@@ -1199,25 +1200,6 @@ static int pl_grm_rule(prolog_t *p, pl_term_var_mapping_t *map, pl_goal_t **goal
 static int pl_grm_term(prolog_t *p, pl_term_var_mapping_t *map, pl_term_t **term, int var) {
 	assert(p);
 	assert(term);
-
-	/* // Test code, this does not work because elsewhere cons/var are treated differently
-	pl_atom_t *atom = NULL;
-	pl_term_t *nterm = NULL;
-	if (pl_accept(p, PLEX_VAR)) {
-		pl_term_t *t = pl_term_var_mapping_search(map, (char*)p->lex.buf);
-		if (!t)
-			t = pl_term_var_mapping_add(p, map, (char*)p->lex.buf);
-		nterm = t;
-		*term = t;
-		return 1;
-	} else if (pl_expect(p, PLEX_ATOM)) {
-		atom = pl_atom_new(p, (char*)p->lex.buf);
-		nterm = pl_term_cons_new(p, atom, 0, NULL);
-	} else {
-		return 0;
-	}
-	*term = nterm;
-	*/
 
 	if (var) {
 		if (pl_accept(p, PLEX_VAR)) {
@@ -1300,13 +1282,14 @@ static int pl_grm_program(prolog_t *p, pl_term_var_mapping_t *map, pl_program_t 
 			*program = head;
 			return 1;
 		}
+
 		if (pl_accept(p, PLEX_DOT))
 			continue;
 		if (pl_accept(p, PLEX_QUERY)) {
 			pl_goal_t *ngoal = NULL;
 			if (!pl_grm_goal(p, map, &ngoal))
 				return 0;
-			if (!pl_expect(p, PLEX_DOT))
+			if (!pl_expect(p, PLEX_DOT)) /* N.B. We could peek here instead, we would need to defer the lex call */
 				return 0;
 			/* return after 1 goal for now */
 			*program = head;
@@ -1405,12 +1388,12 @@ static int pl_eval(prolog_t *p, int (*get)(void *in), void *in) {
 	p->varno = 1;
 	p->sym = 0;
 	while (p->sym != PLEX_EOF && p->sym != PLEX_ERROR && !p->fatal) {
-		if (p->prompt) {
+		/*if (p->prompt) {
 			if (pl_puts(p, p->prompt) < 0) {
 				r = -1;
 				goto end;
 			}
-		}
+		}*/
 		const int st = pl_parse(p, map, &program, &goal);
 		if (!st) {
 			r = -1;
@@ -1693,6 +1676,29 @@ static int pl_set_option(prolog_t *s, char *kv) {
 	return 0;
 }
 
+static int pl_repl(prolog_t *p, FILE *in) {
+	assert(p);
+	assert(in);
+	char line[256] = { 0, };
+	while (true) { // TODO: Sort out > > on empty line
+		if (p->prompt) {
+			if (pl_puts(p, p->prompt) < 0) return -1;
+		}
+		if (!(fgets(line, sizeof line, in)))  /* TODO: Implement slurp */
+			break;
+		if (p->prompt)
+			if (pl_puts(p, p->prompt) < 0) return -1;
+		if (pl_eval_string(p, line) < 0) {
+			if (pl_puts(p, "** error **\n") < 0) return -1;
+		}
+		if (p->fatal) {
+			if (pl_puts(p, "** fatal error **\n") < 0) return -1;
+			return -1;
+		}
+	}
+	return 0;
+}
+
 // TODO: Print out memory stats, custom arena, ...
 int main(int argc, char **argv) {
 	prolog_t prolog = { .alloc = pl_alloc_cb, .put = pl_put_file_cb, .get = pl_get_file_cb, .in = stdin, .out = stdout, .prompt = "> ", }, *p = &prolog;
@@ -1729,14 +1735,7 @@ int main(int argc, char **argv) {
 			return 0;
 		}
 		case 'p': {
-			const int r = pl_eval_file(p, stdin);
-			/*pl_program_t *program = NULL;
-			pl_goal_t *goal = NULL;
-			pl_term_var_mapping_t *map = pl_term_var_mapping_new(p, NULL, NULL, 0);
-			pl_parse(p, map, &program, &goal);
-			int r = 0;
-			if (goal)
-				r = pl_goal_solve(p, goal, program, map);*/
+			const int r = pl_repl(p, stdin);
 			pl_deinit(p);
 			return r < 0;
 		}
