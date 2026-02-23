@@ -219,14 +219,26 @@ static int pl_indent(prolog_t *p, size_t n) {
 	return pl_error(p, 0);
 }
 
+typedef struct {
+	long frees, allocs, reallocs;
+} pl_alloc_cb_t;
+
 static void *pl_alloc_cb(void *arena, void *ptr, size_t old_sz, size_t new_sz) {
-	(void)arena;
+	pl_alloc_cb_t *a = arena;
 	if (!new_sz) {
+		if (a)
+			a->frees++;
 		free(ptr);
 		return NULL;
 	}
 	if (old_sz > new_sz)
 		return ptr;
+	if (a) {
+		if (ptr)
+			a->reallocs++;
+		else
+			a->allocs++;
+	}
 	return realloc(ptr, new_sz);
 }
 
@@ -1676,19 +1688,85 @@ static int pl_set_option(prolog_t *s, char *kv) {
 	return 0;
 }
 
+typedef struct { unsigned char *buf; size_t size, used; } pl_slurp_t;
+
+typedef struct { char *buf; size_t size; } pl_slurp_set_t;
+
+enum {
+	PL_SLURP_NULL_TERMINATE_E = 1 << 0,
+	PL_SLURP_INCLUDE_TERMINATOR_E = 1 << 1,
+	PL_SLURP_BLOCKING_E = 1 << 2,
+};
+
+/* very generic `slurp` routine */
+static int pl_slurp(pl_slurp_t *s, void *(*alloc)(void *arena, void *ptr, size_t old_sz, size_t new_sz), void *arena, int (*get)(void *in), void *in, pl_slurp_set_t *end, pl_slurp_set_t *delete, unsigned flags) {
+	assert(alloc);
+	assert(get);
+	int st = 0;
+	for (;;) {
+		if ((s->used + 2 /* 1 char + NUL terminator */) >= s->size) {
+			size_t nsz = (s->size ? s->size : 8) * 2;
+			assert(nsz > s->size);
+			void *n = alloc(arena, s->buf, 0, nsz);
+			if (!n)
+				return -1;
+			s->buf = n;
+			s->size = nsz;
+		}
+		const int ch = get(in);
+		if (ch < 0) {
+			if (flags & PL_SLURP_BLOCKING_E) /* `get` must sleep/yield in this case */
+				continue;
+			st = 1;
+			break;
+		}
+		if (delete && memchr(delete->buf, ch, delete->size))
+			continue;
+		if (end && memchr(end->buf, ch, end->size)) {
+			if (flags & PL_SLURP_INCLUDE_TERMINATOR_E)
+				s->buf[s->used++] = ch;
+			break;
+		}
+		s->buf[s->used++] = ch;
+	}
+	if (flags & PL_SLURP_NULL_TERMINATE_E)
+		s->buf[s->used++] = 0;
+	return st;
+}
+
+static char *pl_readline(prolog_t *p, int (*get)(void *in), void *in) {
+	assert(p);
+	assert(get);
+	pl_slurp_t s = { .buf = NULL, };
+	pl_slurp_set_t end = { .buf = "\n", .size = 1, };
+	pl_slurp_set_t delete = { .buf = "\r", .size = 1, };
+	const int st = pl_slurp(&s, p->alloc, p->arena, get, in, &end, &delete, PL_SLURP_NULL_TERMINATE_E);
+	if (st < 0) {
+		pl_release(p, s.buf);
+		s.buf = NULL;
+	}
+	if (st > 0) {
+		if (s.used <= 1 /* NUL Terminated */) {
+			pl_release(p, s.buf);
+			s.buf = NULL;
+		}
+	}
+	return (char*)s.buf;
+}
+
 static int pl_repl(prolog_t *p, FILE *in) {
 	assert(p);
 	assert(in);
-	char line[256] = { 0, };
-	while (true) { // TODO: Sort out > > on empty line
+	for (int st = 0; !st;) {
 		if (p->prompt) {
 			if (pl_puts(p, p->prompt) < 0) return -1;
 		}
-		if (!(fgets(line, sizeof line, in)))  /* TODO: Implement slurp */
+		char *line = pl_readline(p, pl_get_file_cb, in);
+		if (!line)
 			break;
-		if (p->prompt)
-			if (pl_puts(p, p->prompt) < 0) return -1;
-		if (pl_eval_string(p, line) < 0) {
+		const int r = pl_eval_string(p, line);
+		pl_release(p, line);
+		if (r < 0) {
 			if (pl_puts(p, "** error **\n") < 0) return -1;
 		}
 		if (p->fatal) {
@@ -1701,7 +1779,8 @@ static int pl_repl(prolog_t *p, FILE *in) {
 
 // TODO: Print out memory stats, custom arena, ...
 int main(int argc, char **argv) {
-	prolog_t prolog = { .alloc = pl_alloc_cb, .put = pl_put_file_cb, .get = pl_get_file_cb, .in = stdin, .out = stdout, .prompt = "> ", }, *p = &prolog;
+	pl_alloc_cb_t stats = { .frees = 0, };
+	prolog_t prolog = { .arena = &stats, .alloc = pl_alloc_cb, .put = pl_put_file_cb, .get = pl_get_file_cb, .in = stdin, .out = stdout, .prompt = "> ", }, *p = &prolog;
 	pl_getopt_t opt = { .init = 0, .error = stderr, };
 
 	for (int ch = 0; (ch = pl_getopt(&opt, argc, argv, "htlpP:r:o:")) != -1; ) {
