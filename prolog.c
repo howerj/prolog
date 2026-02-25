@@ -14,13 +14,11 @@
  * - Replace recursion with iteration where possible.
  * - Documentation; This file should be documented in as much detail
  *   as possible.
- * - Make sure variable is not reused between rules / can be different
  * - Debug variable names and print out id number
  * - Optimizations (mainly around memory usage, not speed).
  * - Code generation, string interning, optimizations
- * - Make a command prompt
  * - Make more test programs; successor arithmetic, grandparent <-> parent <-> child
- * - The grammar "a(X)?" is much nicer than "?a(X).", it should be added.
+ * - The grammar "a(X)?" is much nicer than "?-a(X).", it should be added.
  * - Turn into header only library 
  * - Internally the program needs restructuring, especially around
  *   the grammar and parser. We could also use a pl_list_t type to
@@ -28,6 +26,10 @@
  * - References:
  * <https://www.cl.cam.ac.uk/~am21/papers/wflp00.pdf>
  * <https://www.cl.cam.ac.uk/~am21/research/funnel/prolog2020.cpp>
+ * <https://web.archive.org/web/20030218034509/http://www.research.microsoft.com/research/dtg/davidhov/pap.htm>
+ * <https://news.ycombinator.com/item?id=36821871>
+ * <https://news.ycombinator.com/item?id=47112148>
+ * <https://www.amzi.com/articles/irq_expert_system.htm>
  */
 /* Copyright (C) 2026 by Richard James Howe <howe.r.j.89@gmail.com>
 
@@ -54,7 +56,7 @@ OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. */
 #define PL_LICENSE "0BSD"
 #define PL_EMAIL   "howe.r.j.89@gmail.com"
 #define PL_REPO    "https://github.com/howerj/prolog"
-#define PL_VERSION "v0.0.2"
+#define PL_VERSION "v0.1.0"
 
 #define never() assert(0)
 #define implies(P, Q) assert((!(P)) || (Q))
@@ -65,8 +67,8 @@ OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. */
 #define NELEMS(X) (sizeof (X) / sizeof ((X)[0]))
 #endif
 
-#define PL_MARK (0x80u)
-#define PL_TYPE_MSK (0xFu)
+#define PL_MARK     (0x80u) /* Bit used to indicate marking for garbage collection */
+#define PL_TYPE_MSK (0xFu)  /* Mask used for type mask */
 
 #ifndef PL_GC_THRESHOLD_BYTES /* we could make this scale to the size of the `stack` or `gc` fields */
 #define PL_GC_THRESHOLD_BYTES (1 << 16)
@@ -118,6 +120,8 @@ typedef struct {
 	       gc_stk_idx,  /* index into `stack` */
 	       gc_stk_size, /* size of `stack` */
 	       gc_bytes_since_last_gc; /* counter of bytes allocated, used to determine when to GC */
+	pl_atom_t **all_symbols; /* all allocated symbols */
+	size_t all_symbols_size; /* size of `all_symbols` */
 	int (*get)(void *in); /* get a character of input */
 	int (*put)(void *out, int ch); /* output a character of output */
 	void *in, *out;    /* `in` and `out` passed to `get` and `put` */
@@ -378,7 +382,11 @@ static void pl_gc_stack_set(prolog_t *p, size_t index) {
 	p->gc_stk_idx = index;
 }
 
-static inline void pl_gc_set_or_clear_flag(pl_flags_t *flags, const int set) { assert(flags); if (set) { *flags |= PL_MARK; } else { *flags &= ~PL_MARK; } }
+static inline void pl_gc_set_or_clear_flag(pl_flags_t *flags, const int set) { 
+	assert(flags); 
+	if (set) { *flags |= PL_MARK; } 
+	else { *flags &= ~PL_MARK; } 
+}
 
 static void pl_gc_set(void *x, const int type, const int set) { /* "polymorphism" */
 	if (!x) return;
@@ -587,8 +595,9 @@ static void pl_gc_free(prolog_t *p, void *x, const int type) {
 
 static void pl_sweep(prolog_t *p) {
 	assert(p);
-	size_t left = p->gc_used;
-	for (size_t i = 0; i < p->gc_used; i++) {
+	const size_t used = p->gc_used;
+	size_t left = used;
+	for (size_t i = 0; i < used; i++) {
 		void *ptr = p->gc[i].ptr;
 		const int type = p->gc[i].type & PL_TYPE_MSK;
 		if (pl_gc_get(ptr, type)) {
@@ -597,22 +606,24 @@ static void pl_sweep(prolog_t *p) {
 		}
 		pl_gc_free(p, p->gc[i].ptr, type);
 		p->gc[i].ptr = NULL;
+		p->gc[i].type = 0;
 		left--;
 	}
-	for (size_t i = 0; i < p->gc_used && i < left; i++) { /* compact */
+	const size_t freed = used - left;
+	assert(freed <= used);
+	for (size_t i = 0; i < used; i++) { /* compact */
 		if (p->gc[i].ptr == NULL) {
 			size_t j = i;
-			for (;j < p->gc_used && p->gc[j].ptr == NULL; j++)
+			for (;j < used && p->gc[j].ptr == NULL; j++)
 				/*do nothing*/;
-			if (j >= p->gc_used)
+			if (j >= used)
 				break;
 			p->gc[i] = p->gc[j];
 			p->gc[j].ptr = NULL;
-			i = j;
+			p->gc[j].type = 0;
 		}
 	}
-	// TODO: Fix this!
-	/*p->gc_used = left;*/
+	p->gc_used = left;
 }
 
 static void pl_gc(prolog_t *p, const int force) {
@@ -627,6 +638,8 @@ static void pl_gc(prolog_t *p, const int force) {
 	pl_gc_mark(p, p->map, PL_TVM);
 	for (size_t i = 0; i < p->gc_stk_idx; i++)
 		pl_gc_mark(p, p->stack[i].ptr, p->stack[i].type & PL_TYPE_MSK);
+	for (size_t i = 0; i < p->all_symbols_size; i++)
+		pl_gc_mark(p, p->all_symbols[i], PL_ATOM);
 	pl_sweep(p);
 	p->gc_bytes_since_last_gc = 0;
 }
@@ -659,7 +672,37 @@ static int pl_atom_equal(pl_atom_t *a, pl_atom_t *b) {
 	assert(b);
 	assert(a->name);
 	assert(b->name);
-	return !strcmp(a->name, b->name);
+	return a == b;
+	/*return !strcmp(a->name, b->name);*/
+}
+
+/* TODO: Turn into hash table, being lazy here */
+static pl_atom_t *pl_findsym(prolog_t *p, const char *symbol) {
+	assert(p);
+	assert(symbol);
+	pl_atom_t **syms = p->all_symbols;
+	for (size_t i = 0; i < p->all_symbols_size; i++) {
+		pl_atom_t *a = syms[i];
+		assert(a);
+		if (!strcmp(a->name, symbol))
+			return a;
+	}
+	return NULL;
+}
+
+static pl_atom_t *pl_addsym(prolog_t *p, const char *symbol) {
+	assert(p);
+	assert(symbol);
+	pl_atom_t *n = pl_findsym(p, symbol);
+	if (n)
+		return n;
+	pl_atom_t **syms = pl_reallocate(p, p->all_symbols, sizeof (syms[0]) * (p->all_symbols_size + 1));
+	if (!syms)
+		return NULL;
+	p->all_symbols = syms;
+	n = pl_atom_new(p, symbol);
+	p->all_symbols[p->all_symbols_size++] = n;
+	return n;
 }
 
 static pl_term_t *pl_term_cons_new(prolog_t *p, pl_atom_t *fsym, size_t arity, pl_term_t **terms) {
@@ -708,7 +751,7 @@ static pl_term_t *pl_term_copy(prolog_t *p, pl_term_t *t) {
 			return NULL;
 		c->flags = PL_MARK | PL_CONS;
 		c->t.cons.arity = t->t.cons.arity;
-		c->t.cons.fsym = pl_atom_new(p, t->t.cons.fsym->name);
+		c->t.cons.fsym = pl_addsym(p, t->t.cons.fsym->name);
 		if (!c->t.cons.fsym)
 			return NULL;
 		c->t.cons.args = NULL;
@@ -940,6 +983,7 @@ static int pl_goal_solver_step(prolog_t *p, pl_goal_t *g, pl_program_t *prog, in
 	assert(p);
 	assert(g);
 	assert(prog);
+	nullable(map);
 	if (p->fatal)
 		return pl_error(p, -1);
 	//if (level == 0) 
@@ -950,7 +994,6 @@ static int pl_goal_solver_step(prolog_t *p, pl_goal_t *g, pl_program_t *prog, in
 			return -1; /* return non fatal error */
 		}
 	}
-	/* assert(map); <- nullable */
 	if (!(p->sysflags & PL_SFLAG_PRINT_ONLY_MATCHES)) {
 		if (pl_indent(p, level) < 0) return pl_error(p, -1);
 		if (pl_putf(p, p->buf, sizeof p->buf, "solve@%d: ", level) < 0) return pl_error(p, -1);
@@ -1156,7 +1199,6 @@ again:
 	return PLEX_ERROR;
 }
 
-
 static inline int pl_peek(prolog_t *p) {
 	assert(p);
 	return p->sym;
@@ -1201,7 +1243,7 @@ static int pl_grm_id(prolog_t *p, pl_atom_t **atom) {
 	assert(p);
 	assert(atom);
 	if (pl_expect(p, PLEX_ATOM)) {
-		*atom = pl_atom_new(p, (char*)p->lex.buf);
+		*atom = pl_addsym(p, (char*)p->lex.buf);
 		return 1;
 	}
 	return 0;
@@ -1422,13 +1464,11 @@ end:
 	return r;
 }
 
-
 static int pl_eval_string(prolog_t *p, const char *s) {
 	assert(s);
 	pl_get_string_t v = { .program = s, .length = strlen(s), };
 	return pl_eval(p, pl_get_string_cb, &v);
 }
-
 
 static int pl_eval_file(prolog_t *p, FILE *f) {
 	assert(f);
@@ -1446,12 +1486,12 @@ static void pl_reset(prolog_t *p) {
  * some utility (especially if you can generate this code). */
 static int pl_test1(prolog_t *p) {
 	assert(p);
-	pl_atom_t *at_app = pl_atom_new(p, "app");
-	pl_atom_t *at_cons = pl_atom_new(p, "cons");
-	pl_term_t *f_nil = pl_cons0(p, pl_atom_new(p, "nil"));
-	pl_term_t *f_1 = pl_cons0(p, pl_atom_new(p, "1"));
-	pl_term_t *f_2 = pl_cons0(p, pl_atom_new(p, "2"));
-	pl_term_t *f_3 = pl_cons0(p, pl_atom_new(p, "3"));
+	pl_atom_t *at_app = pl_addsym(p, "app");
+	pl_atom_t *at_cons = pl_addsym(p, "cons");
+	pl_term_t *f_nil = pl_cons0(p, pl_addsym(p, "nil"));
+	pl_term_t *f_1 = pl_cons0(p, pl_addsym(p, "1"));
+	pl_term_t *f_2 = pl_cons0(p, pl_addsym(p, "2"));
+	pl_term_t *f_3 = pl_cons0(p, pl_addsym(p, "3"));
 
 	pl_term_t *v_x = pl_term_var_new(p);
 	pl_term_t *lhs1 = pl_cons3(p, at_app, f_nil, v_x, v_x);
@@ -1605,7 +1645,7 @@ static int pl_help(FILE *out, const char *arg0) {
 	assert(arg0);
 
 	return fprintf(out, 
-		"Usage: %s \n\n"
+		"Usage: %s [-htp] [-o k=v] files...\n\n"
 		"Project: A tiny Prolog interpreter.\n"
 		"License: " PL_LICENSE "\n"
 		"Author:  " PL_AUTHOR "\n"
@@ -1613,10 +1653,10 @@ static int pl_help(FILE *out, const char *arg0) {
 		"Email:   " PL_EMAIL "\n"
 		"Version: " PL_VERSION "\n"
 		"\nOptions:\n"
-		"\t-h, display this help message and quit.\n"
-		"\t-o key=value. set an option.\n"
-		"\t-t, run built in tests.\n"
-		"\t-p, read program from stdin and execute query.\n"
+		"\t-h, display this help message and exit.\n"
+		"\t-t, run built in tests and exit.\n"
+		"\t-o key=value, set an option.\n"
+		"\t-s '<prog>', run a string as a program and exit.\n"
 		"\nThis program return non-zero on error.\n\n"
 		"This program is a reimplementation of a prolog interpreter available\n"
 		"at <https://www.cl.cam.ac.uk/~am21/research/funnel/prolog2020.cpp>,\n"
@@ -1627,7 +1667,7 @@ static int pl_help(FILE *out, const char *arg0) {
 		"\tman(bob).\n"
 		"\tman(socrates).\n"
 		"\tmortal(X) :- man(X).\n"
-		"\t? mortal(socrates).\n"
+		"\t?- mortal(socrates).\n"
 		"\nThe grammar is:\n\n"
 		"\tid      := atom\n"
 		"\tterm    := var | [ atom { '(' rule ')' } ]\n"
@@ -1635,8 +1675,6 @@ static int pl_help(FILE *out, const char *arg0) {
 		"\tclause  := term [ ':-' rule ]\n"
 		"\tgoal    := '?-' rule\n"
 		"\tprogram := { [ goal | clause ] '.' } EOF\n\n",
-
-
 		arg0);
 }
 
@@ -1647,12 +1685,14 @@ static int pl_deinit(prolog_t *p) {
 	pl_release(p, p->gc);
 	pl_release(p, p->lex.buf);
 	pl_release(p, p->stack);
+	pl_release(p, p->all_symbols);
 	p->lex.used = 0;
 	p->lex.length = 0;
 	p->gc = NULL;
 	p->stack = NULL;
 	p->db = NULL;
 	p->tail = NULL;
+	p->all_symbols = NULL;
 	return 0;
 }
 
@@ -1666,26 +1706,6 @@ static int pl_flag(const char *v) {
 			return 0;
 	}
 	return -1;
-}
-
-static int pl_set_option(prolog_t *s, char *kv) {
-	assert(s);
-	assert(kv);
-	char *k = kv, *v = NULL;
-	if ((v = strchr(kv, '=')) == NULL || *v == '\0') {
-		return -1;
-	}
-	*v++ = '\0';
-	if (!strcmp(k, "depth")) { s->maxlevel = atol(v); return 0; }
-	const long r = pl_flag(v);
-	if (r < 0) return -1;
-	if (!strcmp(k, "gc"))     { pl_set_flag(&s->sysflags, PL_SFLAG_GC_OFF_E, !r); } 
-	else if (!strcmp(k, "parse-debug")) { pl_set_flag(&s->sysflags, PL_SFLAG_PARSER_DEBUG, r); }
-	else if (!strcmp(k, "reverse")) { pl_set_flag(&s->sysflags, PL_SFLAG_REVERSE_PROGRAM_ORDER, r); }
-	else if (!strcmp(k, "terse")) { pl_set_flag(&s->sysflags, PL_SFLAG_PRINT_ONLY_MATCHES, r); }
-	else if (!strcmp(k, "novar")) { pl_set_flag(&s->sysflags, PL_SFLAG_ONLY_PRINT_YES_ON_MATCH, r); }
-	else { return -2; }
-	return 0;
 }
 
 typedef struct { unsigned char *buf; size_t size, used; } pl_slurp_t;
@@ -1777,13 +1797,34 @@ static int pl_repl(prolog_t *p, FILE *in) {
 	return 0;
 }
 
-// TODO: Print out memory stats, custom arena, ...
+static int pl_set_option(prolog_t *s, char *kv) {
+	assert(s);
+	assert(kv);
+	char *k = kv, *v = NULL;
+	if ((v = strchr(kv, '=')) == NULL || *v == '\0')
+		return -1;
+	*v++ = '\0';
+	if (!strcmp(k, "depth")) { s->maxlevel = atol(v); return 0; }
+	const long r = pl_flag(v);
+	if (r < 0) return -1;
+	if (!strcmp(k, "gc"))     { pl_set_flag(&s->sysflags, PL_SFLAG_GC_OFF_E, !r); } 
+	else if (!strcmp(k, "parse-debug")) { pl_set_flag(&s->sysflags, PL_SFLAG_PARSER_DEBUG, r); }
+	else if (!strcmp(k, "reverse")) { pl_set_flag(&s->sysflags, PL_SFLAG_REVERSE_PROGRAM_ORDER, r); }
+	else if (!strcmp(k, "terse")) { pl_set_flag(&s->sysflags, PL_SFLAG_PRINT_ONLY_MATCHES, r); }
+	else if (!strcmp(k, "novar")) { pl_set_flag(&s->sysflags, PL_SFLAG_ONLY_PRINT_YES_ON_MATCH, r); }
+	else { return -2; }
+	return 0;
+}
+
+// TODO: Print out memory stats, custom arena, read in files, default prolog
+// prompt, random order mode, ...
 int main(int argc, char **argv) {
+	const char *prompt = "> ";
 	pl_alloc_cb_t stats = { .frees = 0, };
-	prolog_t prolog = { .arena = &stats, .alloc = pl_alloc_cb, .put = pl_put_file_cb, .get = pl_get_file_cb, .in = stdin, .out = stdout, .prompt = "> ", }, *p = &prolog;
+	prolog_t prolog = { .arena = &stats, .alloc = pl_alloc_cb, .put = pl_put_file_cb, .get = pl_get_file_cb, .in = stdin, .out = stdout, }, *p = &prolog;
 	pl_getopt_t opt = { .init = 0, .error = stderr, };
 
-	for (int ch = 0; (ch = pl_getopt(&opt, argc, argv, "htlpP:r:o:")) != -1; ) {
+	for (int ch = 0; (ch = pl_getopt(&opt, argc, argv, "htos:")) != -1; ) {
 		switch (ch) {
 		case 'h': return pl_help(stderr, argv[0]) < 0;
 		case 't': {
@@ -1796,35 +1837,42 @@ int main(int argc, char **argv) {
 		case 'o': {
 			if (pl_set_option(p, opt.arg) < 0) {
 				(void)fprintf(stderr, "invalid option argument -- %s\n", opt.arg);
-				return 1;
+				goto fail;
 			}
 			break;
 		}
-		case 'r': {
-			p->maxlevel = atoi(opt.arg);
-			break;
-		}
-		case 'l': {
-			for (int l = 0; (l = pl_lexer(p)) != PLEX_EOF;) {
-				const bool named = l == PLEX_ATOM || l == PLEX_VAR;
-				char *b = named ? (char*)p->lex.buf : "";
-				if (fprintf(p->out, "lex %c/%s\n", l, b) < 0)
-					return 1;
-			}
-			return 0;
-		}
-		case 'p': {
-			const int r = pl_repl(p, stdin);
-			pl_deinit(p);
-			return r < 0;
-		}
-		case 'P': {
+		case 's': {
 			const int r = pl_eval_string(p, opt.arg);
-			pl_deinit(p);
-			return r < 0;
+			if (r < 0)
+				goto fail;
+			break;
 		}
-		default: return 1;
+		default: goto fail;
 		}
 	}
+	if (opt.index == argc) {
+		p->prompt = prompt;
+		const int r = pl_repl(p, stdin);
+		pl_deinit(p);
+		return r < 0;
+	} else {
+		for (int i = opt.index; i < argc; i++) {
+			FILE *in = fopen(argv[i], "rb");
+			if (!in) {
+				(void)fprintf(stderr, "unable to open file '%s' in mode '%s'\n", argv[i], "rb");
+				goto fail;
+			}
+			const int r = pl_eval_file(p, in);
+			if (fclose(in) < 0)
+				goto fail;
+			if (r < 0)
+				goto fail;
+		}
+	}
+	pl_deinit(p);
 	return 0;
+fail:
+	pl_deinit(p);
+	return 1;
 }
+
