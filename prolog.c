@@ -14,9 +14,8 @@
  * - Replace recursion with iteration where possible.
  * - Documentation; This file should be documented in as much detail
  *   as possible.
- * - Debug variable names and print out id number
  * - Optimizations (mainly around memory usage, not speed).
- * - Code generation, string interning, optimizations
+ * - Code generation
  * - Make more test programs; successor arithmetic, grandparent <-> parent <-> child
  * - The grammar "a(X)?" is much nicer than "?-a(X).", it should be added.
  * - Turn into header only library 
@@ -30,6 +29,8 @@
  * <https://news.ycombinator.com/item?id=36821871>
  * <https://news.ycombinator.com/item?id=47112148>
  * <https://www.amzi.com/articles/irq_expert_system.htm>
+ * <https://github.com/stolk/GPGOAP>
+ * <https://web.archive.org/web/20230912145018/https://alumni.media.mit.edu/~jorkin/goap.html>
  */
 /* Copyright (C) 2026 by Richard James Howe <howe.r.j.89@gmail.com>
 
@@ -97,7 +98,7 @@ struct pl_term { pl_flags_t flags; union { pl_term_cons_t cons; pl_term_var_t va
 struct pl_goal { pl_flags_t flags; /*pl_term_cons_t*/pl_term_t *car; pl_goal_t *cdr; };
 struct pl_trail { pl_flags_t flags; /*pl_term_var_t*/pl_term_t *car; pl_trail_t *cdr; };
 struct pl_program { pl_flags_t flags; pl_clause_t *car; pl_program_t *cdr; };
-struct pl_term_var_mapping { pl_flags_t flags; pl_term_var_mapping_t *parent; pl_term_t **var; char **name; size_t length; };
+struct pl_term_var_mapping { pl_flags_t flags; pl_term_var_mapping_t *parent; pl_term_t **vars; char **names; size_t length; };
 typedef struct { void *ptr; uintptr_t type; } pl_gc_t;
 typedef struct { uint8_t *buf; size_t used, length; int ungetc; } pl_lexer_t;
 
@@ -506,9 +507,9 @@ static void pl_gc_mark(prolog_t *p, void *x, const int type) {
 	case PL_TVM: {
 		pl_term_var_mapping_t *n = x;
 		pl_gc_set(n, PL_TVM, 1);
-		if (n->var) {
+		if (n->vars) {
 			for (size_t i = 0; i < n->length; i++) {
-				pl_term_t *t = n->var[i];
+				pl_term_t *t = n->vars[i];
 				if (!t)
 					continue;
 				const int ntype = t->flags & PL_TYPE_MSK;
@@ -575,17 +576,17 @@ static void pl_gc_free(prolog_t *p, void *x, const int type) {
 	case PL_TVM: {
 		pl_term_var_mapping_t *n = x;
 		for (size_t i = 0; i < n->length; i++) {
-			if (n->name) {
-				pl_release(p, n->name[i]);
-				n->name[i] = NULL;
+			if (n->names) {
+				pl_release(p, n->names[i]);
+				n->names[i] = NULL;
 			}
-			if (n->var)
-				n->var[i] = NULL;
+			if (n->vars)
+				n->vars[i] = NULL;
 		}
-		pl_release(p, n->var);
-		pl_release(p, n->name);
-		n->var = NULL;
-		n->name = NULL;
+		pl_release(p, n->vars);
+		pl_release(p, n->names);
+		n->vars = NULL;
+		n->names = NULL;
 		pl_release(p, n);
 		break;
 	}
@@ -821,6 +822,7 @@ static bool pl_term_unify(prolog_t *p, pl_term_t *s, pl_term_t *t) {
 		pl_term_t *x = t; /* swap unification target */
 		t = s;
 		s = x;
+		// TODO: Add operators 
 		if (!pl_atom_equal(s->t.cons.fsym, t->t.cons.fsym) || s->t.cons.arity != t->t.cons.arity)
 			return false;
 		for (size_t i = 0; i < s->t.cons.arity; i++)
@@ -972,8 +974,8 @@ static int pl_term_var_mapping_show_answer(prolog_t *p, pl_term_var_mapping_t *m
 	if (!map || map->length == 0 || (p->sysflags & PL_SFLAG_ONLY_PRINT_YES_ON_MATCH))
 		return pl_puts(p, "yes\n") < 0 ? -1 : 0;
 	for (size_t i = 0; i < map->length; i++) {
-		if (pl_putf(p, p->buf, sizeof p->buf, "%s = ", map->name[i]) < 0) return pl_error(p, -1);
-		if (pl_term_print(p, map->var[i]) < 0) return pl_error(p, -1);
+		if (pl_putf(p, p->buf, sizeof p->buf, "%s = ", map->names[i]) < 0) return pl_error(p, -1);
+		if (pl_term_print(p, map->vars[i]) < 0) return pl_error(p, -1);
 		if (pl_puts(p, "\n") < 0) return pl_error(p, -1);
 	}
 	return pl_error(p, 0);
@@ -1003,7 +1005,7 @@ static int pl_goal_solver_step(prolog_t *p, pl_goal_t *g, pl_program_t *prog, in
 	const size_t gstk = p->gc_stk_idx;
 	for (pl_program_t *q = prog; q != NULL; q = q->cdr) {
 		pl_trail_t *t = pl_trail_note(p);
-		pl_clause_t *c = pl_clause_copy(p, q->car); // TODO: add to gc stack
+		pl_clause_t *c = pl_clause_copy(p, q->car);
 		pl_trail_undo(p, t);
 		if (!(p->sysflags & PL_SFLAG_PRINT_ONLY_MATCHES)) {
 			if (pl_indent(p, level) < 0) return pl_error(p, -1);
@@ -1034,19 +1036,18 @@ static int pl_goal_solver_step(prolog_t *p, pl_goal_t *g, pl_program_t *prog, in
 	return pl_error(p, 0);
 }
 
-static pl_term_var_mapping_t *pl_term_var_mapping_new(prolog_t *p, pl_term_t **ts, char **names, size_t count) {
+static pl_term_var_mapping_t *pl_term_var_mapping_new(prolog_t *p, pl_term_t **ts, char **ns, size_t count) {
 	assert(p);
 	mutual(count != 0, ts);
-	mutual(count != 0, names);
+	mutual(count != 0, ns);
 	pl_term_var_mapping_t *tvm = pl_gc_allocate(p, sizeof *tvm, PL_TVM);
-	// TODO: Rename vars
-	pl_term_t **_ts = count ? pl_allocate(p, sizeof (_ts[0]) * count) : NULL;
-	char **_names = count ? pl_allocate(p, sizeof (_names[0]) * count) : NULL;
+	pl_term_t **vars = count ? pl_allocate(p, sizeof (vars[0]) * count) : NULL;
+	char **names = count ? pl_allocate(p, sizeof (names[0]) * count) : NULL;
 	if (count) {
-		if (!tvm || !_ts || !_names) {
+		if (!tvm || !vars || !names) {
 			pl_release(p, tvm);
-			pl_release(p, _ts);
-			pl_release(p, _names);
+			pl_release(p, vars);
+			pl_release(p, names);
 			return NULL;
 		}
 	} else {
@@ -1054,13 +1055,13 @@ static pl_term_var_mapping_t *pl_term_var_mapping_new(prolog_t *p, pl_term_t **t
 			return NULL;
 	}
 	tvm->flags = PL_MARK | PL_TVM;
-	tvm->var = _ts;
-	tvm->name = _names;
+	tvm->vars = vars;
+	tvm->names = names;
 	tvm->length = count;
 	for (size_t i = 0; i < count; i++) {
-		_ts[i] = ts[i];
-		char *name = pl_strdup(p, names[i]);
-		_names[i] = name;
+		vars[i] = ts[i];
+		char *name = pl_strdup(p, ns[i]);
+		names[i] = name;
 		if (!name) /* gc will handle this */
 			return NULL;
 	}
@@ -1072,8 +1073,8 @@ static pl_term_t *pl_term_var_mapping_search(pl_term_var_mapping_t *map, const c
 	assert(name);
 	for (pl_term_var_mapping_t *m = map; m; m = m->parent)
 		for (size_t i = 0; i < m->length; i++)
-			if (!strcmp(m->name[i], name))
-				return m->var[i];
+			if (!strcmp(m->names[i], name))
+				return m->vars[i];
 	return NULL;
 }
 
@@ -1085,20 +1086,20 @@ static pl_term_t *pl_term_var_mapping_add(prolog_t *p, pl_term_var_mapping_t *ma
 	if (t)
 		return t;
 	char **_name = NULL;
-	pl_term_t **ts = pl_reallocate(p, map->var, sizeof (ts[0]) * (map->length + 1));
+	pl_term_t **ts = pl_reallocate(p, map->vars, sizeof (ts[0]) * (map->length + 1));
 	if (!ts)
 		return NULL;
-	map->var = ts;
-	_name = pl_reallocate(p, map->name, sizeof (_name[0]) * (map->length + 1));
+	map->vars = ts;
+	_name = pl_reallocate(p, map->names, sizeof (_name[0]) * (map->length + 1));
 	if (!_name) /* partial initialization handled by GC */
 		return NULL;
-	map->name = _name;
+	map->names = _name;
 	char *n = pl_strdup(p, name);
 	if (!n) /* partial initialization handled by GC */
 		return NULL;
-	map->name[map->length] = n;
+	map->names[map->length] = n;
 	t = pl_term_var_new(p);
-	map->var[map->length] = t;
+	map->vars[map->length] = t;
 	map->length++;
 	return t;
 }
@@ -1875,4 +1876,5 @@ fail:
 	pl_deinit(p);
 	return 1;
 }
+
 
