@@ -14,8 +14,9 @@
  * - Replace recursion with iteration where possible.
  * - Documentation; This file should be documented in as much detail
  *   as possible.
+ * - Random rule mode?
  * - Optimizations (mainly around memory usage, not speed).
- * - Code generation
+ * - Code generation, 
  * - Make more test programs; successor arithmetic, grandparent <-> parent <-> child
  * - The grammar "a(X)?" is much nicer than "?-a(X).", it should be added.
  * - Turn into header only library 
@@ -106,7 +107,7 @@ enum { /* These are the parser tokens, there are only a few. */
 	PLEX_LPAR  = '(', PLEX_RPAR = ')', PLEX_IS   = '=', 
 	PLEX_COMMA = ',', PLEX_ATOM = 'A', PLEX_VAR  = 'V', 
 	PLEX_QUERY = '?', PLEX_DOT  = '.', PLEX_EOF  = 'E', 
-	PLEX_ERROR = -1,
+	PLEX_ERROR = -1,  PLEX_QUESTION = 'Q',
 };
 
 typedef struct {
@@ -122,6 +123,13 @@ typedef struct {
 	       gc_stk_size, /* size of `stack` */
 	       gc_bytes_since_last_gc; /* counter of bytes allocated, used to determine when to GC */
 	pl_atom_t **all_symbols; /* all allocated symbols */
+	pl_atom_t *sym_any,      /* `_` */
+		  *sym_read,     /* read predicate */
+		  *sym_write,    /* write predicate */
+		  *sym_not,      /* not predicate */
+		  *sym_equal,    /* equal predicate */
+		  *sym_unequal,  /* not-equal predicate */
+		  *sym_cut;      /* `!` predicate */
 	size_t all_symbols_size; /* size of `all_symbols` */
 	int (*get)(void *in); /* get a character of input */
 	int (*put)(void *out, int ch); /* output a character of output */
@@ -144,6 +152,7 @@ enum {
 	PL_SFLAG_ONLY_PRINT_YES_ON_MATCH = 1 << 2u, /* only print `yes` on match, no var mapping */
 	PL_SFLAG_REVERSE_PROGRAM_ORDER   = 1 << 3u, /* reverse program order, this affects finding solutions! */
 	PL_SFLAG_PARSER_DEBUG            = 1 << 4u, /* print out symbols for debugging purposes in parser */
+	PL_SFLAG_PRINT_STATS_ON_DEINIT   = 1 << 5u, /* print overall statistics when uninitializing */
 };
 
 enum {
@@ -225,7 +234,7 @@ static int pl_indent(prolog_t *p, size_t n) {
 }
 
 typedef struct {
-	long frees, allocs, reallocs;
+	long frees, allocs, reallocs, total;
 } pl_alloc_cb_t;
 
 static void *pl_alloc_cb(void *arena, void *ptr, size_t old_sz, size_t new_sz) {
@@ -243,6 +252,7 @@ static void *pl_alloc_cb(void *arena, void *ptr, size_t old_sz, size_t new_sz) {
 			a->reallocs++;
 		else
 			a->allocs++;
+		a->total += (new_sz - old_sz);
 	}
 	return realloc(ptr, new_sz);
 }
@@ -610,8 +620,6 @@ static void pl_sweep(prolog_t *p) {
 		p->gc[i].type = 0;
 		left--;
 	}
-	const size_t freed = used - left;
-	assert(freed <= used);
 	for (size_t i = 0; i < used; i++) { /* compact */
 		if (p->gc[i].ptr == NULL) {
 			size_t j = i;
@@ -671,10 +679,7 @@ static int pl_atom_print(prolog_t *p, pl_atom_t *a) {
 static int pl_atom_equal(pl_atom_t *a, pl_atom_t *b) {
 	assert(a);
 	assert(b);
-	assert(a->name);
-	assert(b->name);
-	return a == b;
-	/*return !strcmp(a->name, b->name);*/
+	return a == b; /* atoms are interned */
 }
 
 /* TODO: Turn into hash table, being lazy here */
@@ -822,9 +827,11 @@ static bool pl_term_unify(prolog_t *p, pl_term_t *s, pl_term_t *t) {
 		pl_term_t *x = t; /* swap unification target */
 		t = s;
 		s = x;
-		// TODO: Add operators 
+		// TODO: Add operators, and `_`
 		if (!pl_atom_equal(s->t.cons.fsym, t->t.cons.fsym) || s->t.cons.arity != t->t.cons.arity)
 			return false;
+		/*if (pl_atom_equal(t->t.cons.fsym, p->any))
+			return true;*/
 		for (size_t i = 0; i < s->t.cons.arity; i++)
 			if (!pl_term_unify(p, s->t.cons.args[i], t->t.cons.args[i]))
 				return false;
@@ -925,19 +932,31 @@ static pl_program_t *pl_program_new(prolog_t *p, pl_clause_t *car, pl_program_t 
 	return c;
 }
 
-static pl_goal_t *pl_goal_copy(prolog_t *p, pl_goal_t *g) {
-	assert(p);
-	assert(g);
-	pl_term_t *x = pl_term_copy(p, g->car);
-	pl_goal_t *n = g->cdr ? pl_goal_copy(p, g->cdr) : NULL;
-	return pl_goal_new(p, x, n);
-}
-
-
 static pl_goal_t *pl_goal_append(prolog_t *p, pl_goal_t *g, pl_goal_t *l) {
 	assert(p);
 	assert(g);
-	return pl_goal_new(p, g->car, g->cdr ? pl_goal_append(p, g->cdr, l) : l /* NULL? */);
+	nullable(l);
+	pl_goal_t *r = NULL, *tail = NULL;
+	for (; g; g = g->cdr) {
+		pl_term_t *x = pl_term_copy(p, g->car);
+		pl_goal_t *n = pl_goal_new(p, x, NULL);
+		if (!r) {
+			r = n;
+			tail = n;
+		} else {
+			tail->cdr = n;
+			tail = n;
+		}
+	}
+	assert(tail);
+	tail->cdr = l;
+	return r;
+}
+
+static pl_goal_t *pl_goal_copy(prolog_t *p, pl_goal_t *g) {
+	assert(p);
+	assert(g);
+	return pl_goal_append(p, g, NULL);
 }
 
 static int pl_goal_print(prolog_t *p, pl_goal_t *g) {
@@ -1036,7 +1055,7 @@ static int pl_goal_solver_step(prolog_t *p, pl_goal_t *g, pl_program_t *prog, in
 	return pl_error(p, 0);
 }
 
-static pl_term_var_mapping_t *pl_term_var_mapping_new(prolog_t *p, pl_term_t **ts, char **ns, size_t count) {
+static pl_term_var_mapping_t *pl_term_var_mapping_new(prolog_t *p, pl_term_t **ts, char **ns, const size_t count) {
 	assert(p);
 	mutual(count != 0, ts);
 	mutual(count != 0, ns);
@@ -1150,8 +1169,10 @@ again:
 	case '(': return PLEX_LPAR;
 	case '?': 
 		ch = pl_get(p);
-		if (ch != '-')
-			return PLEX_ERROR;
+		if (ch != '-') {
+			if (pl_ungetc(p, ch) < 0) return PLEX_ERROR;
+			return PLEX_QUESTION;
+		}
 		return PLEX_QUERY;
 	case ')': return PLEX_RPAR;
 	case ':': {
@@ -1162,7 +1183,7 @@ again:
 	}
 	case -1: return PLEX_EOF;
 	default: {
-		if (!pl_isalpha(ch))
+		if (!pl_isalpha(ch) && ch != '_')
 			return PLEX_ERROR;
 		l->used = 0;
 		if (l->length == 0) {
@@ -1176,7 +1197,7 @@ again:
 			assert(l->used < l->length);
 			l->buf[l->used++] = ch;
 			if (l->used >= (l->length - 1)) {
-				const size_t nlength = l->length * 2l;
+				const size_t nlength = l->length * 2ul;
 				assert(nlength > l->length);
 				uint8_t *n = pl_reallocate(p, l->buf, nlength);
 				if (!n)
@@ -1185,14 +1206,14 @@ again:
 				l->length = nlength;
 			}
 			ch = pl_get(p);
-			if (!pl_isalpha(ch)) {
+			if (!pl_isalpha(ch) && ch != '_') {
 				if (pl_ungetc(p, ch) < 0)
 					return PLEX_ERROR;
 				break;
 			}
 		} while (true);
 		l->buf[l->used] = 0;
-		if (pl_isupper(l->buf[0]))
+		if (pl_isupper(l->buf[0]) || !strcmp((char*)l->buf, "_"))
 			return PLEX_VAR;
 		return PLEX_ATOM;
 	}
@@ -1443,12 +1464,6 @@ static int pl_eval(prolog_t *p, int (*get)(void *in), void *in) {
 	p->varno = 1;
 	p->sym = 0;
 	while (p->sym != PLEX_EOF && p->sym != PLEX_ERROR && !p->fatal) {
-		/*if (p->prompt) {
-			if (pl_puts(p, p->prompt) < 0) {
-				r = -1;
-				goto end;
-			}
-		}*/
 		const int st = pl_parse(p, map, &program, &goal);
 		if (!st) {
 			r = -1;
@@ -1657,6 +1672,7 @@ static int pl_help(FILE *out, const char *arg0) {
 		"\t-h, display this help message and exit.\n"
 		"\t-t, run built in tests and exit.\n"
 		"\t-o key=value, set an option.\n"
+		"\t-p string, set prompt.\n"
 		"\t-s '<prog>', run a string as a program and exit.\n"
 		"\nThis program return non-zero on error.\n\n"
 		"This program is a reimplementation of a prolog interpreter available\n"
@@ -1679,10 +1695,27 @@ static int pl_help(FILE *out, const char *arg0) {
 		arg0);
 }
 
+static int pl_stats(prolog_t *p) {
+	assert(p);
+	assert(p->arena);
+	pl_alloc_cb_t *stats = p->arena;
+	uint8_t buf[256] = { 0, };
+	if (pl_putf(p, buf, sizeof buf, "frees=%ld allocs=%ld reallocs=%ld total=%ld\n",
+			stats->frees,
+			stats->allocs,
+			stats->reallocs,
+			stats->total) < 0) return -1;
+	return -1;
+}
+
 static int pl_deinit(prolog_t *p) {
 	assert(p);
 	pl_sweep(p); /* clear all set flags */
 	pl_sweep(p);
+	int r = 0;
+	if (p->sysflags & PL_SFLAG_PRINT_STATS_ON_DEINIT)
+		if (pl_stats(p) < 0)
+			r = -1;
 	pl_release(p, p->gc);
 	pl_release(p, p->lex.buf);
 	pl_release(p, p->stack);
@@ -1694,7 +1727,7 @@ static int pl_deinit(prolog_t *p) {
 	p->db = NULL;
 	p->tail = NULL;
 	p->all_symbols = NULL;
-	return 0;
+	return p->fatal || r < 0 ? -1 : 0;
 }
 
 static int pl_flag(const char *v) {
@@ -1808,24 +1841,38 @@ static int pl_set_option(prolog_t *s, char *kv) {
 	if (!strcmp(k, "depth")) { s->maxlevel = atol(v); return 0; }
 	const long r = pl_flag(v);
 	if (r < 0) return -1;
-	if (!strcmp(k, "gc"))     { pl_set_flag(&s->sysflags, PL_SFLAG_GC_OFF_E, !r); } 
+	if (!strcmp(k, "gc"))     { if (r) { pl_gc_on(s); } else { pl_gc_off(s); } } 
 	else if (!strcmp(k, "parse-debug")) { pl_set_flag(&s->sysflags, PL_SFLAG_PARSER_DEBUG, r); }
 	else if (!strcmp(k, "reverse")) { pl_set_flag(&s->sysflags, PL_SFLAG_REVERSE_PROGRAM_ORDER, r); }
 	else if (!strcmp(k, "terse")) { pl_set_flag(&s->sysflags, PL_SFLAG_PRINT_ONLY_MATCHES, r); }
 	else if (!strcmp(k, "novar")) { pl_set_flag(&s->sysflags, PL_SFLAG_ONLY_PRINT_YES_ON_MATCH, r); }
+	else if (!strcmp(k, "stats")) { pl_set_flag(&s->sysflags, PL_SFLAG_PRINT_STATS_ON_DEINIT, r); }
 	else { return -2; }
 	return 0;
 }
 
-// TODO: Print out memory stats, custom arena, read in files, default prolog
-// prompt, random order mode, ...
+static int pl_init(prolog_t *p) {
+	if (p->sym_any) /* use this to indicate initialization */
+		return 0;
+	p->sym_any = pl_addsym(p, "_");
+	p->sym_read = pl_addsym(p, "read");
+	p->sym_write = pl_addsym(p, "write");
+	p->sym_not = pl_addsym(p, "not");
+	p->sym_equal = pl_addsym(p, "equal");
+	p->sym_unequal = pl_addsym(p, "unequal");
+	p->sym_cut = pl_addsym(p, "cut");
+	return p->fatal ? -1 : 0;
+}
+
 int main(int argc, char **argv) {
 	const char *prompt = "> ";
 	pl_alloc_cb_t stats = { .frees = 0, };
 	prolog_t prolog = { .arena = &stats, .alloc = pl_alloc_cb, .put = pl_put_file_cb, .get = pl_get_file_cb, .in = stdin, .out = stdout, }, *p = &prolog;
 	pl_getopt_t opt = { .init = 0, .error = stderr, };
+	if (pl_init(p) < 0)
+		return 1;
 
-	for (int ch = 0; (ch = pl_getopt(&opt, argc, argv, "htos:")) != -1; ) {
+	for (int ch = 0; (ch = pl_getopt(&opt, argc, argv, "hto:s:p:")) != -1; ) {
 		switch (ch) {
 		case 'h': return pl_help(stderr, argv[0]) < 0;
 		case 't': {
@@ -1848,6 +1895,9 @@ int main(int argc, char **argv) {
 				goto fail;
 			break;
 		}
+		case 'p':
+			prompt = opt.arg;
+			break;
 		default: goto fail;
 		}
 	}
@@ -1876,5 +1926,4 @@ fail:
 	pl_deinit(p);
 	return 1;
 }
-
 
