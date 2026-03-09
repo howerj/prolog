@@ -175,7 +175,7 @@ static int pl_ungetc(prolog_t *p, const int ch) {
 	if (r >= 0)
 		return -1;
 	p->lex.ungetc = ch;
-	return ch;
+	return 0;
 }
 
 static int pl_get(prolog_t *p) {
@@ -1376,6 +1376,15 @@ static int pl_grm_program(prolog_t *p, pl_term_var_mapping_t *map, pl_program_t 
 			pl_term_var_mapping_t *nmap = pl_term_var_mapping_new(p, NULL, NULL, 0);
 			if (!pl_grm_clause(p, nmap, &clause))
 				return 0;
+			if (pl_accept(p, PLEX_QUESTION)) {
+				if (clause->cdr) {
+					return 0;
+				}
+				*program = head;
+				*goal = clause;
+				return 1;
+			}
+
 			if (p->sysflags & PL_SFLAG_REVERSE_PROGRAM_ORDER) {
 				progs = pl_program_new(p, clause, progs);
 				head = progs;
@@ -1495,11 +1504,15 @@ static void pl_reset(prolog_t *p) {
 	assert(p);
 	p->db = NULL;
 	p->tail = NULL;
+	p->gc_stk_idx = 0;
 }
 
 /* Instead of parsing a string we can instead construct a prolog program via
  * calling prolog constructs directly. It is far more cumbersome, but it has
- * some utility (especially if you can generate this code). */
+ * some utility (especially if you can generate this code). This code and test
+ * program comes from the original prolog C++ program and shows how append can
+ * be implemented, and how reversing the order in which rules appear can change
+ * what happens when.  */
 static int pl_test1(prolog_t *p) {
 	assert(p);
 	pl_atom_t *at_app = pl_addsym(p, "app");
@@ -1536,11 +1549,12 @@ static int pl_test1(prolog_t *p) {
 	char *varname[] =  { "I", "J", };
 	pl_term_var_mapping_t *var_name_map = pl_term_var_mapping_new(p, varvar, varname, NELEMS(varname));
 
-	if (pl_puts(p, "=======Append with traditional clause order:\n") < 0) return -1;
+	if (pl_puts(p, "======= Append with traditional clause order:\n") < 0) return -1;
 	pl_goal_solve(p, g1, test_p1, var_name_map);
 	pl_reset(p);
-	if (pl_puts(p, "\n=======Append with reversed clause order:\n") < 0) return -1;
+	if (pl_puts(p, "\n======= Append with reversed clause order:\n") < 0) return -1;
 	pl_goal_solve(p, g1, test_p2, var_name_map);
+	pl_gc(p, 1);
 	return 0;
 }
 
@@ -1680,18 +1694,27 @@ static int pl_help(FILE *out, const char *arg0) {
 		"with a paper here <https://www.cl.cam.ac.uk/~am21/papers/wflp00.pdf>,\n"
 		"by Alan Mycroft. This program adds more functionality, a primitive garbage\n"
 		"collector and a parser for the language.\n\n"
+		"Options:\n\n"
+		"\t* depth=0 (off) or max depth\n"
+		"\t* gc=on|off : force garbage collection on or off (default on).\n"
+		"\t* parse-debug=on|off : enable parse debug messages\n"
+		"\t* reverse=on|off : append new rules in reverse order to database\n"
+		"\t* terse=on|off : enable terse mode\n"
+		"\t* novar=on|off : do not print variables, just 'yes'\n"
+		"\t* stats=on|off : print memory stats\n\n"
 		"Examples:\n\n"
 		"\tman(bob).\n"
 		"\tman(socrates).\n"
 		"\tmortal(X) :- man(X).\n"
 		"\t?- mortal(socrates).\n"
+		"\tmortal(socrates)?\n"
 		"\nThe grammar is:\n\n"
 		"\tid      := atom\n"
 		"\tterm    := var | [ atom { '(' rule ')' } ]\n"
 		"\trule    := term { ',' term }\n"
-		"\tclause  := term [ ':-' rule ]\n"
-		"\tgoal    := '?-' rule\n"
-		"\tprogram := { [ goal | clause ] '.' } EOF\n\n",
+		"\tclause  := term [ ':-' rule ] '.'\n"
+		"\tgoal    := '?-' rule '.' | term '?'\n"
+		"\tprogram := { goal | clause } EOF\n\n",
 		arg0);
 }
 
