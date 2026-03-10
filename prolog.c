@@ -15,10 +15,10 @@
  * - Documentation; This file should be documented in as much detail
  *   as possible.
  * - Random rule mode?
+ * - Add numbers, lists?
  * - Optimizations (mainly around memory usage, not speed).
  * - Code generation, 
  * - Make more test programs; successor arithmetic, grandparent <-> parent <-> child
- * - The grammar "a(X)?" is much nicer than "?-a(X).", it should be added.
  * - Turn into header only library 
  * - Internally the program needs restructuring, especially around
  *   the grammar and parser. We could also use a pl_list_t type to
@@ -31,6 +31,7 @@
  * <https://news.ycombinator.com/item?id=47112148>
  * <https://www.amzi.com/articles/irq_expert_system.htm>
  * <https://github.com/stolk/GPGOAP>
+ * <https://github.com/no382001/prolog>
  * <https://web.archive.org/web/20230912145018/https://alumni.media.mit.edu/~jorkin/goap.html>
  */
 /* Copyright (C) 2026 by Richard James Howe <howe.r.j.89@gmail.com>
@@ -58,7 +59,7 @@ OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. */
 #define PL_LICENSE "0BSD"
 #define PL_EMAIL   "howe.r.j.89@gmail.com"
 #define PL_REPO    "https://github.com/howerj/prolog"
-#define PL_VERSION "v0.1.0"
+#define PL_VERSION "v0.2.0"
 
 #define never() assert(0)
 #define implies(P, Q) assert((!(P)) || (Q))
@@ -124,6 +125,8 @@ typedef struct {
 	       gc_bytes_since_last_gc; /* counter of bytes allocated, used to determine when to GC */
 	pl_atom_t **all_symbols; /* all allocated symbols */
 	pl_atom_t *sym_any,      /* `_` */
+		  *sym_true,     /* success! */
+		  *sym_false,    /* unsuccess! */
 		  *sym_read,     /* read predicate */
 		  *sym_write,    /* write predicate */
 		  *sym_not,      /* not predicate */
@@ -1000,6 +1003,61 @@ static int pl_term_var_mapping_show_answer(prolog_t *p, pl_term_var_mapping_t *m
 	return pl_error(p, 0);
 }
 
+static int pl_builtin_equal(pl_term_t *t) {
+	assert(t);
+	const size_t arity = t->t.cons.arity;
+	pl_term_t *a = arity ? t->t.cons.args[0] : NULL;
+	const int atype = a ? a->flags & PL_TYPE_MSK : 0;
+	const int aarity = a ? a->t.cons.arity : 0;
+	for (size_t i = 1; i < arity; i++) {
+		pl_term_t *b = t->t.cons.args[i];
+		const int btype = b->flags & PL_TYPE_MSK;
+		const int barity = b->t.cons.arity;
+		if (btype != atype)
+			return 0;
+		if (btype == PL_CONS) {
+			if (aarity != barity || !pl_atom_equal(a->t.cons.fsym, b->t.cons.fsym))
+				return 0;
+		} else {
+			assert(btype == PL_VAR);
+			if (a != b)
+				return 0;
+		}
+	}
+	return 1;
+}
+
+static int pl_builtins(prolog_t *p, pl_term_t *t) {
+	assert(p);
+	assert(t);
+	pl_atom_t *sym = t->t.cons.fsym;
+	if (sym == p->sym_write) { // TODO: Fix this, when it is run
+		if (pl_term_print(p, t) < 0) return -1;
+	} else if (sym == p->sym_equal) {
+		return pl_builtin_equal(t);
+	} else if (sym == p->sym_unequal) {
+		return !pl_builtin_equal(t);
+	} else if (sym == p->sym_read) {
+		if (t->t.cons.arity != 0)
+			return -1;
+	} else if (sym == p->sym_cut) {
+		if (t->t.cons.arity != 0)
+			return -1;
+	} else if (sym == p->sym_not) {
+		if (t->t.cons.arity != 0)
+			return -1;
+	} else if (sym == p->sym_false) {
+		// TODO: Implement this correctly
+		return 0;
+	} else if (sym == p->sym_true) {
+		return 1;
+	} else {
+		/* not a built in */
+	}
+
+	return 0;
+}
+
 static int pl_goal_solver_step(prolog_t *p, pl_goal_t *g, pl_program_t *prog, int level, pl_term_var_mapping_t *map) {
 	assert(p);
 	assert(g);
@@ -1007,8 +1065,8 @@ static int pl_goal_solver_step(prolog_t *p, pl_goal_t *g, pl_program_t *prog, in
 	nullable(map);
 	if (p->fatal)
 		return pl_error(p, -1);
-	//if (level == 0) 
-	//	pl_gc_stack_set(p, 0);
+	/*if (level == 0) 
+		pl_gc_stack_set(p, 0); */
 	if (p->maxlevel) {
 		if (level > p->maxlevel) {
 			(void)pl_putf(p, p->buf, sizeof p->buf, "maxlevel exceeded: %d\n", level);
@@ -1026,6 +1084,16 @@ static int pl_goal_solver_step(prolog_t *p, pl_goal_t *g, pl_program_t *prog, in
 		pl_trail_t *t = pl_trail_note(p);
 		pl_clause_t *c = pl_clause_copy(p, q->car);
 		pl_trail_undo(p, t);
+
+		const int r = pl_builtins(p, g->car);
+		if (r < 0)
+			return pl_error(p, -1);
+		if (r == 1) {
+			if (pl_term_var_mapping_show_answer(p, map) < 0)
+				return pl_error(p, -1);
+			return pl_error(p, 0);
+		}
+
 		if (!(p->sysflags & PL_SFLAG_PRINT_ONLY_MATCHES)) {
 			if (pl_indent(p, level) < 0) return pl_error(p, -1);
 			if (pl_puts(p, "  try:") < 0) return pl_error(p, -1);
@@ -1580,7 +1648,6 @@ static int pl_test2(prolog_t *p) {
 		/*"? X(alice).",*/
 	};
 	const size_t count = NELEMS(queries);
-
 	if (pl_eval_string(p, database) < 0)
 		return -1;
 	for (size_t i = 0; i < count; i++) {
@@ -1592,7 +1659,6 @@ static int pl_test2(prolog_t *p) {
 	}
 	return 0;
 }
-
 
 typedef struct {
 	char *arg;   /* parsed argument */
@@ -1878,6 +1944,8 @@ static int pl_init(prolog_t *p) {
 	if (p->sym_any) /* use this to indicate initialization */
 		return 0;
 	p->sym_any = pl_addsym(p, "_");
+	p->sym_true = pl_addsym(p, "true");
+	p->sym_false = pl_addsym(p, "false");
 	p->sym_read = pl_addsym(p, "read");
 	p->sym_write = pl_addsym(p, "write");
 	p->sym_not = pl_addsym(p, "not");
