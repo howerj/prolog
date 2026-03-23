@@ -77,6 +77,10 @@ OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. */
 #define PL_GC_THRESHOLD_BYTES (1 << 16)
 #endif
 
+#ifndef PL_NEWLINE
+#define PL_NEWLINE "\n"
+#endif
+
 struct pl_term;
 struct pl_term_var_mapping;
 struct pl_program;
@@ -156,6 +160,7 @@ enum {
 	PL_SFLAG_REVERSE_PROGRAM_ORDER   = 1 << 3u, /* reverse program order, this affects finding solutions! */
 	PL_SFLAG_PARSER_DEBUG            = 1 << 4u, /* print out symbols for debugging purposes in parser */
 	PL_SFLAG_PRINT_STATS_ON_DEINIT   = 1 << 5u, /* print overall statistics when uninitializing */
+	PL_SFLAG_DUMP_DB_ON_DEINIT       = 1 << 6u, /* dump database when uninitializing */
 };
 
 enum {
@@ -991,14 +996,23 @@ static int pl_clause_print(prolog_t *p, pl_clause_t *c) {
 	return pl_goal_print(p, c->cdr);
 }
 
+static int pl_program_print(prolog_t *p, pl_program_t *prog) {
+	assert(p);
+	for (; prog; prog = prog->cdr) {
+		if (pl_clause_print(p, prog->car) < 0) return -1;
+		if (pl_puts(p, PL_NEWLINE) < 0) return -1;
+	}
+	return 0;
+}
+
 static int pl_term_var_mapping_show_answer(prolog_t *p, pl_term_var_mapping_t *map) {
 	assert(p);
 	if (!map || map->length == 0 || (p->sysflags & PL_SFLAG_ONLY_PRINT_YES_ON_MATCH))
-		return pl_puts(p, "yes\n") < 0 ? -1 : 0;
+		return pl_puts(p, "yes" PL_NEWLINE) < 0 ? -1 : 0;
 	for (size_t i = 0; i < map->length; i++) {
 		if (pl_putf(p, p->buf, sizeof p->buf, "%s = ", map->names[i]) < 0) return pl_error(p, -1);
 		if (pl_term_print(p, map->vars[i]) < 0) return pl_error(p, -1);
-		if (pl_puts(p, "\n") < 0) return pl_error(p, -1);
+		if (pl_puts(p, PL_NEWLINE) < 0) return pl_error(p, -1);
 	}
 	return pl_error(p, 0);
 }
@@ -1027,9 +1041,26 @@ static int pl_builtin_equal(pl_term_t *t) {
 	return 1;
 }
 
-static int pl_builtins(prolog_t *p, pl_term_t *t) {
+// TODO: Make sure these do not get redefined
+static int pl_builtins_is(prolog_t *p, pl_atom_t *sym) {
+	assert(p);
+	if (sym == p->sym_write) { return 1; } 
+	else if (sym == p->sym_equal) { return 1; } 
+	else if (sym == p->sym_unequal) { return 1; } 
+	else if (sym == p->sym_read) { return 1; } 
+	else if (sym == p->sym_cut) { return 1; } 
+	else if (sym == p->sym_not) { return 1; } 
+	else if (sym == p->sym_false) { return 1; } 
+	else if (sym == p->sym_true) { return 1; } 
+	else { }
+	return 0;
+}
+
+static int pl_builtins(prolog_t *p, pl_term_t *t, bool *match) {
 	assert(p);
 	assert(t);
+	assert(match);
+	*match = true;
 	pl_atom_t *sym = t->t.cons.fsym;
 	if (sym == p->sym_write) { // TODO: Fix this, when it is run
 		if (pl_term_print(p, t) < 0) return -1;
@@ -1037,22 +1068,26 @@ static int pl_builtins(prolog_t *p, pl_term_t *t) {
 		return pl_builtin_equal(t);
 	} else if (sym == p->sym_unequal) {
 		return !pl_builtin_equal(t);
-	} else if (sym == p->sym_read) {
+	} else if (sym == p->sym_read) { // TODO
+		if (t->t.cons.arity != 1)
+			return -1;
+	} else if (sym == p->sym_cut) { // TODO
 		if (t->t.cons.arity != 0)
 			return -1;
-	} else if (sym == p->sym_cut) {
-		if (t->t.cons.arity != 0)
-			return -1;
-	} else if (sym == p->sym_not) {
-		if (t->t.cons.arity != 0)
+	} else if (sym == p->sym_not) { // TODO
+		if (t->t.cons.arity != 1)
 			return -1;
 	} else if (sym == p->sym_false) {
-		// TODO: Implement this correctly
+		if (t->t.cons.arity != 0)
+			return -1;
 		return 0;
 	} else if (sym == p->sym_true) {
+		if (t->t.cons.arity != 0)
+			return -1;
 		return 1;
 	} else {
 		/* not a built in */
+		*match = false;
 	}
 
 	return 0;
@@ -1065,11 +1100,14 @@ static int pl_goal_solver_step(prolog_t *p, pl_goal_t *g, pl_program_t *prog, in
 	nullable(map);
 	if (p->fatal)
 		return pl_error(p, -1);
-	/*if (level == 0) 
-		pl_gc_stack_set(p, 0); */
+	/* Note that we do not want to do the following:
+		if (level == 0) 
+			pl_gc_stack_set(p, 0); 
+	This is so that we can push objects to the stack to save them from
+	garbage collection. */
 	if (p->maxlevel) {
 		if (level > p->maxlevel) {
-			(void)pl_putf(p, p->buf, sizeof p->buf, "maxlevel exceeded: %d\n", level);
+			(void)pl_putf(p, p->buf, sizeof p->buf, "maxlevel exceeded: %d" PL_NEWLINE, level);
 			return -1; /* return non fatal error */
 		}
 	}
@@ -1077,7 +1115,7 @@ static int pl_goal_solver_step(prolog_t *p, pl_goal_t *g, pl_program_t *prog, in
 		if (pl_indent(p, level) < 0) return pl_error(p, -1);
 		if (pl_putf(p, p->buf, sizeof p->buf, "solve@%d: ", level) < 0) return pl_error(p, -1);
 		if (pl_goal_print(p, g) < 0) return pl_error(p, -1);
-		if (pl_puts(p, "\n") < 0) return pl_error(p, -1);
+		if (pl_puts(p, PL_NEWLINE) < 0) return pl_error(p, -1);
 	}
 	const size_t gstk = p->gc_stk_idx;
 	for (pl_program_t *q = prog; q != NULL; q = q->cdr) {
@@ -1085,11 +1123,16 @@ static int pl_goal_solver_step(prolog_t *p, pl_goal_t *g, pl_program_t *prog, in
 		pl_clause_t *c = pl_clause_copy(p, q->car);
 		pl_trail_undo(p, t);
 
-		const int r = pl_builtins(p, g->car);
-		if (r < 0)
+		bool match = false;
+		const int r = pl_builtins(p, g->car, &match);
+		if (r < 0) {
 			return pl_error(p, -1);
-		if (r == 1) {
+		} else if (r > 0) {
 			if (pl_term_var_mapping_show_answer(p, map) < 0)
+				return pl_error(p, -1);
+			return pl_error(p, 0);
+		} else if (match) {
+			if (p->fatal)
 				return pl_error(p, -1);
 			return pl_error(p, 0);
 		}
@@ -1098,7 +1141,7 @@ static int pl_goal_solver_step(prolog_t *p, pl_goal_t *g, pl_program_t *prog, in
 			if (pl_indent(p, level) < 0) return pl_error(p, -1);
 			if (pl_puts(p, "  try:") < 0) return pl_error(p, -1);
 			if (pl_clause_print(p, c) < 0) return pl_error(p, -1);
-			if (pl_puts(p, "\n") < 0) return pl_error(p, -1);
+			if (pl_puts(p, PL_NEWLINE) < 0) return pl_error(p, -1);
 		}
 		if (pl_term_unify(p, g->car, c->car)) {
 			pl_goal_t *gdash = c->cdr == NULL ? g->cdr : pl_goal_append(p, c->cdr, g->cdr);
@@ -1112,7 +1155,7 @@ static int pl_goal_solver_step(prolog_t *p, pl_goal_t *g, pl_program_t *prog, in
 		} else {
 			if (!(p->sysflags & PL_SFLAG_PRINT_ONLY_MATCHES)) {
 				if (pl_indent(p, level) < 0) return pl_error(p, -1);
-				if (pl_puts(p, "  nomatch.\n") < 0) return pl_error(p, -1);
+				if (pl_puts(p, "  nomatch." PL_NEWLINE) < 0) return pl_error(p, -1);
 			}
 		}
 		pl_trail_undo(p, t);
@@ -1299,7 +1342,7 @@ static int pl_accept(prolog_t *p, int sym) {
 	if (p->sym == sym) {
 		if (p->sysflags & PL_SFLAG_PARSER_DEBUG) {
 			uint8_t buf[32] = { 0, };
-			(void)pl_putf(p, buf, sizeof (buf), "%c%c", sym, sym == PLEX_DOT || sym == PLEX_EOF ? '\n' : ' ');
+			(void)pl_putf(p, buf, sizeof (buf), "%c%s", sym, sym == PLEX_DOT || sym == PLEX_EOF ? PL_NEWLINE : " ");
 		}
 		p->sym = pl_lexer(p);
 		return 1;
@@ -1312,7 +1355,7 @@ static int pl_expect(prolog_t *p, int sym) {
 	if (pl_accept(p, sym))
 		return 1;
 	uint8_t buf[128] = { 0, };
-	if (pl_putf(p, buf, sizeof buf, "error: invalid parse, expected: %d/'%c'\n", sym, sym) < 0)
+	if (pl_putf(p, buf, sizeof buf, "error: invalid parse, expected: %d/'%c'" PL_NEWLINE, sym, sym) < 0)
 		return -1;
 	return 0;
 }
@@ -1516,7 +1559,7 @@ static int pl_goal_solve(prolog_t *p, pl_goal_t *g, pl_program_t *prog, pl_term_
 	if (!g)
 		return 0;
 	if (!prog && !p->db) {
-		if (pl_puts(p, "No program.\n") < 0)
+		if (pl_puts(p, "No program." PL_NEWLINE) < 0)
 			return pl_error(p, PL_ERROR_OUTPUT_E);
 		return 0;
 	}
@@ -1617,10 +1660,10 @@ static int pl_test1(prolog_t *p) {
 	char *varname[] =  { "I", "J", };
 	pl_term_var_mapping_t *var_name_map = pl_term_var_mapping_new(p, varvar, varname, NELEMS(varname));
 
-	if (pl_puts(p, "======= Append with traditional clause order:\n") < 0) return -1;
+	if (pl_puts(p, "======= Append with traditional clause order:" PL_NEWLINE) < 0) return -1;
 	pl_goal_solve(p, g1, test_p1, var_name_map);
 	pl_reset(p);
-	if (pl_puts(p, "\n======= Append with reversed clause order:\n") < 0) return -1;
+	if (pl_puts(p, PL_NEWLINE "======= Append with reversed clause order:" PL_NEWLINE) < 0) return -1;
 	pl_goal_solve(p, g1, test_p2, var_name_map);
 	pl_gc(p, 1);
 	return 0;
@@ -1640,19 +1683,19 @@ static int pl_test2(prolog_t *p) {
 		"?- mortal(god).",
 		"?- mortal(X).",
 		"?- man(X).",
-		"?- woman(X).",
+		"woman(X)?",
 		"?- man(Y), woman(X).",
 		"?- man(X), woman(X).",
 		"?- man(X), mortal(X).",
 		"?- man(Y), mortal(X).",
-		/*"? X(alice).",*/
+		/*"?- X(alice).",*/
 	};
 	const size_t count = NELEMS(queries);
 	if (pl_eval_string(p, database) < 0)
 		return -1;
 	for (size_t i = 0; i < count; i++) {
 		uint8_t buf[128] = { 0, };
-		if (pl_putf(p, buf, sizeof buf, "\n======= Query #%d '%s'\n", (int)i, queries[i]) < 0)
+		if (pl_putf(p, buf, sizeof buf, PL_NEWLINE "======= Query #%d '%s'" PL_NEWLINE, (int)i, queries[i]) < 0)
 			return -1;
 		if (pl_eval_string(p, queries[i]) < 0)
 			return -1;
@@ -1707,7 +1750,7 @@ static int pl_getopt(pl_getopt_t *opt, const int argc, char *const argv[], const
 		if (!*opt->place)
 			opt->index++;
 		if (opt->error && *fmt != ':')
-			if (fprintf(opt->error, "illegal option -- %c\n", opt->option) < 0)
+			if (fprintf(opt->error, "illegal option -- %c" PL_NEWLINE, opt->option) < 0)
 				return BADIO_E;
 		return BADCH_E;
 	}
@@ -1724,7 +1767,7 @@ static int pl_getopt(pl_getopt_t *opt, const int argc, char *const argv[], const
 			if (*fmt == ':')
 				return BADARG_E;
 			if (opt->error)
-				if (fprintf(opt->error, "option requires an argument -- %c\n", opt->option) < 0)
+				if (fprintf(opt->error, "option requires an argument -- %c" PL_NEWLINE, opt->option) < 0)
 					return BADIO_E;
 			return BADCH_E;
 		} else	{ /* white space */
@@ -1740,7 +1783,7 @@ static int pl_help(FILE *out, const char *arg0) {
 	assert(out);
 	assert(arg0);
 
-	return fprintf(out, 
+	return fprintf(out, /* I'm not going to use PL_NEWLINE here, it would be too much. */
 		"Usage: %s [-htp] [-o k=v] files...\n\n"
 		"Project: A tiny Prolog interpreter.\n"
 		"License: " PL_LICENSE "\n"
@@ -1752,7 +1795,6 @@ static int pl_help(FILE *out, const char *arg0) {
 		"\t-h, display this help message and exit.\n"
 		"\t-t, run built in tests and exit.\n"
 		"\t-o key=value, set an option.\n"
-		"\t-p string, set prompt.\n"
 		"\t-s '<prog>', run a string as a program and exit.\n"
 		"\nThis program return non-zero on error.\n\n"
 		"This program is a reimplementation of a prolog interpreter available\n"
@@ -1761,13 +1803,14 @@ static int pl_help(FILE *out, const char *arg0) {
 		"by Alan Mycroft. This program adds more functionality, a primitive garbage\n"
 		"collector and a parser for the language.\n\n"
 		"Options:\n\n"
-		"\t* depth=0 (off) or max depth\n"
+		"\t* depth=0 (off) or max depth.\n"
+		"\t* prompt=string set string.\n"
 		"\t* gc=on|off : force garbage collection on or off (default on).\n"
-		"\t* parse-debug=on|off : enable parse debug messages\n"
-		"\t* reverse=on|off : append new rules in reverse order to database\n"
-		"\t* terse=on|off : enable terse mode\n"
-		"\t* novar=on|off : do not print variables, just 'yes'\n"
-		"\t* stats=on|off : print memory stats\n\n"
+		"\t* parse-debug=on|off : enable parse debug messages.\n"
+		"\t* reverse=on|off : append new rules in reverse order to database.\n"
+		"\t* terse=on|off : enable terse mode.\n"
+		"\t* novar=on|off : do not print variables, just 'yes'.\n"
+		"\t* stats=on|off : print memory stats.\n\n"
 		"Examples:\n\n"
 		"\tman(bob).\n"
 		"\tman(socrates).\n"
@@ -1789,7 +1832,7 @@ static int pl_stats(prolog_t *p) {
 	assert(p->arena);
 	pl_alloc_cb_t *stats = p->arena;
 	uint8_t buf[256] = { 0, };
-	if (pl_putf(p, buf, sizeof buf, "frees=%ld allocs=%ld reallocs=%ld total=%ld\n",
+	if (pl_putf(p, buf, sizeof buf, "frees=%ld allocs=%ld reallocs=%ld total=%ld" PL_NEWLINE,
 			stats->frees,
 			stats->allocs,
 			stats->reallocs,
@@ -1799,9 +1842,12 @@ static int pl_stats(prolog_t *p) {
 
 static int pl_deinit(prolog_t *p) {
 	assert(p);
+	int r = 0;
+	if (p->sysflags & PL_SFLAG_DUMP_DB_ON_DEINIT)
+		if (pl_program_print(p, p->db) < 0)
+			r = -1;
 	pl_sweep(p); /* clear all set flags */
 	pl_sweep(p);
-	int r = 0;
 	if (p->sysflags & PL_SFLAG_PRINT_STATS_ON_DEINIT)
 		if (pl_stats(p) < 0)
 			r = -1;
@@ -1910,10 +1956,10 @@ static int pl_repl(prolog_t *p, FILE *in) {
 		const int r = pl_eval_string(p, line);
 		pl_release(p, line);
 		if (r < 0) {
-			if (pl_puts(p, "** error **\n") < 0) return -1;
+			if (pl_puts(p, "** error **" PL_NEWLINE) < 0) return -1;
 		}
 		if (p->fatal) {
-			if (pl_puts(p, "** fatal error **\n") < 0) return -1;
+			if (pl_puts(p, "** fatal error **" PL_NEWLINE) < 0) return -1;
 			return -1;
 		}
 	}
@@ -1928,6 +1974,7 @@ static int pl_set_option(prolog_t *s, char *kv) {
 		return -1;
 	*v++ = '\0';
 	if (!strcmp(k, "depth")) { s->maxlevel = atol(v); return 0; }
+	if (!strcmp(k, "prompt")) { s->prompt = v; return 0; }
 	const long r = pl_flag(v);
 	if (r < 0) return -1;
 	if (!strcmp(k, "gc"))     { if (r) { pl_gc_on(s); } else { pl_gc_off(s); } } 
@@ -1936,6 +1983,7 @@ static int pl_set_option(prolog_t *s, char *kv) {
 	else if (!strcmp(k, "terse")) { pl_set_flag(&s->sysflags, PL_SFLAG_PRINT_ONLY_MATCHES, r); }
 	else if (!strcmp(k, "novar")) { pl_set_flag(&s->sysflags, PL_SFLAG_ONLY_PRINT_YES_ON_MATCH, r); }
 	else if (!strcmp(k, "stats")) { pl_set_flag(&s->sysflags, PL_SFLAG_PRINT_STATS_ON_DEINIT, r); }
+	else if (!strcmp(k, "dump")) { pl_set_flag(&s->sysflags, PL_SFLAG_DUMP_DB_ON_DEINIT, r); }
 	else { return -2; }
 	return 0;
 }
@@ -1956,26 +2004,30 @@ static int pl_init(prolog_t *p) {
 }
 
 int main(int argc, char **argv) {
-	const char *prompt = "> ";
 	pl_alloc_cb_t stats = { .frees = 0, };
-	prolog_t prolog = { .arena = &stats, .alloc = pl_alloc_cb, .put = pl_put_file_cb, .get = pl_get_file_cb, .in = stdin, .out = stdout, }, *p = &prolog;
+	prolog_t prolog = { 
+		.arena = &stats, .alloc = pl_alloc_cb, 
+		.put = pl_put_file_cb, .get = pl_get_file_cb, 
+		.in = stdin, .out = stdout, 
+	}, *p = &prolog;
 	pl_getopt_t opt = { .init = 0, .error = stderr, };
 	if (pl_init(p) < 0)
 		return 1;
 
-	for (int ch = 0; (ch = pl_getopt(&opt, argc, argv, "hto:s:p:")) != -1; ) {
+	for (int ch = 0; (ch = pl_getopt(&opt, argc, argv, "hto:s:")) != -1; ) {
 		switch (ch) {
 		case 'h': return pl_help(stderr, argv[0]) < 0;
 		case 't': {
 			const int r1 = pl_test1(p);
 			pl_reset(p);
 			const int r2 = pl_test2(p);
-			pl_deinit(p);
+			if (pl_deinit(p) < 0)
+				return 1;
 			return r1 < 0 || r2 < 0;
 		}
 		case 'o': {
 			if (pl_set_option(p, opt.arg) < 0) {
-				(void)fprintf(stderr, "invalid option argument -- %s\n", opt.arg);
+				(void)fprintf(stderr, "invalid option argument -- %s" PL_NEWLINE, opt.arg);
 				goto fail;
 			}
 			break;
@@ -1986,22 +2038,19 @@ int main(int argc, char **argv) {
 				goto fail;
 			break;
 		}
-		case 'p':
-			prompt = opt.arg;
-			break;
 		default: goto fail;
 		}
 	}
+	p->prompt = p->prompt ? p->prompt : "> ";
 	if (opt.index == argc) {
-		p->prompt = prompt;
 		const int r = pl_repl(p, stdin);
-		pl_deinit(p);
+		if (pl_deinit(p) < 0) return 1;
 		return r < 0;
 	} else {
 		for (int i = opt.index; i < argc; i++) {
 			FILE *in = fopen(argv[i], "rb");
 			if (!in) {
-				(void)fprintf(stderr, "unable to open file '%s' in mode '%s'\n", argv[i], "rb");
+				(void)fprintf(stderr, "unable to open file '%s' in mode '%s'" PL_NEWLINE, argv[i], "rb");
 				goto fail;
 			}
 			const int r = pl_eval_file(p, in);
@@ -2011,8 +2060,7 @@ int main(int argc, char **argv) {
 				goto fail;
 		}
 	}
-	pl_deinit(p);
-	return 0;
+	return pl_deinit(p) < 0;
 fail:
 	pl_deinit(p);
 	return 1;
