@@ -1041,7 +1041,6 @@ static int pl_builtin_equal(pl_term_t *t) {
 	return 1;
 }
 
-// TODO: Make sure these do not get redefined
 static int pl_builtins_is(prolog_t *p, pl_atom_t *sym) {
 	assert(p);
 	if (sym == p->sym_write) { return 1; } 
@@ -1056,27 +1055,40 @@ static int pl_builtins_is(prolog_t *p, pl_atom_t *sym) {
 	return 0;
 }
 
-static int pl_builtins(prolog_t *p, pl_term_t *t, bool *match) {
+static int pl_lexer(prolog_t *p);
+
+static int pl_builtins(prolog_t *p, pl_term_t *t, pl_term_t *s, pl_term_var_mapping_t *map, bool *match) {
 	assert(p);
 	assert(t);
+	assert(s);
 	assert(match);
+	nullable(map);
 	*match = true;
 	pl_atom_t *sym = t->t.cons.fsym;
 	if (sym == p->sym_write) { // TODO: Fix this, when it is run
 		if (pl_term_print(p, t) < 0) return -1;
-	} else if (sym == p->sym_equal) {
+	} else if (sym == p->sym_equal) { // TODO: Unify sub-elements?
 		return pl_builtin_equal(t);
-	} else if (sym == p->sym_unequal) {
+	} else if (sym == p->sym_unequal) {  // TODO: Unify sub-elements?
 		return !pl_builtin_equal(t);
-	} else if (sym == p->sym_read) { // TODO
+	} else if (sym == p->sym_read) { // TODO; fix this
 		if (t->t.cons.arity != 1)
 			return -1;
+		const int sym = pl_lexer(p);
+		if (sym != PL_ATOM) {
+			if (pl_puts(p, "** error -- not an atom" PL_NEWLINE) < 0) return pl_error(p, -1);
+			return -1;
+		}
+		pl_atom_t *a = pl_addsym(p, (char*)p->lex.buf);
+		pl_term_t *n = pl_term_cons_new(p, a, 0, NULL);
+		return !pl_term_unify(p, t->t.cons.args[0], n);
 	} else if (sym == p->sym_cut) { // TODO
 		if (t->t.cons.arity != 0)
 			return -1;
-	} else if (sym == p->sym_not) { // TODO
+	} else if (sym == p->sym_not) {
 		if (t->t.cons.arity != 1)
 			return -1;
+		return !pl_term_unify(p, t->t.cons.args[0], s);
 	} else if (sym == p->sym_false) {
 		if (t->t.cons.arity != 0)
 			return -1;
@@ -1124,16 +1136,20 @@ static int pl_goal_solver_step(prolog_t *p, pl_goal_t *g, pl_program_t *prog, in
 		pl_trail_undo(p, t);
 
 		bool match = false;
-		const int r = pl_builtins(p, g->car, &match);
+		const int r = pl_builtins(p, g->car, c->car, map, &match);
 		if (r < 0) {
 			return pl_error(p, -1);
 		} else if (r > 0) {
 			if (pl_term_var_mapping_show_answer(p, map) < 0)
 				return pl_error(p, -1);
 			return pl_error(p, 0);
-		} else if (match) {
+		} else if (match) { /* is a built in that failed unification */
 			if (p->fatal)
 				return pl_error(p, -1);
+			if (!(p->sysflags & PL_SFLAG_PRINT_ONLY_MATCHES)) {
+				if (pl_indent(p, level) < 0) return pl_error(p, -1);
+				if (pl_puts(p, "  nomatch." PL_NEWLINE) < 0) return pl_error(p, -1);
+			}
 			return pl_error(p, 0);
 		}
 
@@ -1494,6 +1510,15 @@ static int pl_grm_program(prolog_t *p, pl_term_var_mapping_t *map, pl_program_t 
 				*program = head;
 				*goal = clause;
 				return 1;
+			}
+			for (pl_clause_t *x = clause; x; x = x->cdr) {
+				pl_term_t *c = x->car;
+				if ((c->flags & PL_TYPE_MSK) == PL_VAR)
+					continue;
+				if (pl_builtins_is(p, c->t.cons.fsym)) {
+					if (pl_puts(p, "** error -- cannot redefine built-in" PL_NEWLINE) < 0) return pl_error(p, -1);
+					return -1;
+				}
 			}
 
 			if (p->sysflags & PL_SFLAG_REVERSE_PROGRAM_ORDER) {

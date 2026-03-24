@@ -6,7 +6,10 @@ TARGET=prolog
 
 all default: ${TARGET}
 
-test run: ${TARGET}
+run: ${TARGET}
+	./${TARGET}
+
+test: ${TARGET}
 	./${TARGET} -t
 
 debug:
